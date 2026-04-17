@@ -7,7 +7,6 @@ REPO="manansati/cloneable"
 BINARY="cloneable"
 INSTALL_DIR="$HOME/.local/bin"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
 SAFFRON="\033[38;2;255;140;0m"
 GREEN="\033[38;2;0;230;118m"
 RED="\033[38;2;255;82;82m"
@@ -19,7 +18,6 @@ success() { printf "  ${GREEN}✓${RESET}  %s\n" "$1"; }
 error()   { printf "  ${RED}✗${RESET}  %s\n" "$1" >&2; exit 1; }
 muted()   { printf "  ${GRAY}%s${RESET}\n" "$1"; }
 
-# ── Detect OS and architecture ────────────────────────────────────────────────
 detect_os() {
   case "$(uname -s)" in
     Linux*)  echo "linux" ;;
@@ -30,13 +28,12 @@ detect_os() {
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
+    x86_64|amd64)  echo "amd64" ;;
     arm64|aarch64) echo "arm64" ;;
-    *) error "Unsupported architecture: $(uname -m)" ;;
+    *)             error "Unsupported architecture: $(uname -m)" ;;
   esac
 }
 
-# ── Fetch latest version from GitHub ─────────────────────────────────────────
 fetch_latest_version() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
@@ -47,16 +44,12 @@ fetch_latest_version() {
       | grep '"tag_name"' \
       | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/'
   else
-    error "curl or wget is required to download Cloneable"
+    error "curl or wget is required"
   fi
 }
 
-# ── Download binary ───────────────────────────────────────────────────────────
 download_binary() {
-  local version="$1"
-  local os="$2"
-  local arch="$3"
-
+  local version="$1" os="$2" arch="$3"
   local filename="${BINARY}_${version}_${os}_${arch}.tar.gz"
   local url="https://github.com/${REPO}/releases/download/v${version}/${filename}"
   local tmp_dir
@@ -65,48 +58,68 @@ download_binary() {
   info "Downloading Cloneable v${version} for ${os}/${arch}..."
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "${tmp_dir}/${filename}" || \
-      error "Download failed. Check your internet connection."
+    curl -fsSL "$url" -o "${tmp_dir}/${filename}" || error "Download failed"
   else
-    wget -qO "${tmp_dir}/${filename}" "$url" || \
-      error "Download failed. Check your internet connection."
+    wget -qO "${tmp_dir}/${filename}" "$url" || error "Download failed"
   fi
 
-  # Extract
   tar -xzf "${tmp_dir}/${filename}" -C "${tmp_dir}"
-
-  # Move binary to install dir
   mkdir -p "$INSTALL_DIR"
   mv "${tmp_dir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
   chmod +x "${INSTALL_DIR}/${BINARY}"
-
-  # Cleanup
   rm -rf "$tmp_dir"
 }
 
-# ── Ensure install dir is in PATH ─────────────────────────────────────────────
+# Write PATH export to every shell config that exists on this system.
+# This covers users who switch shells or have multiple installed.
 ensure_in_path() {
-  if echo "$PATH" | grep -q "$INSTALL_DIR"; then
-    return
+  local export_line="export PATH=\"${INSTALL_DIR}:\$PATH\""
+  local fish_line="fish_add_path ${INSTALL_DIR}"
+  local added=0
+
+  # bash
+  for f in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    if [ -f "$f" ] && ! grep -q "$INSTALL_DIR" "$f" 2>/dev/null; then
+      printf "\n# Added by Cloneable\n%s\n" "$export_line" >> "$f"
+      muted "Updated $f"
+      added=1
+    fi
+  done
+
+  # zsh
+  if [ -f "$HOME/.zshrc" ] && ! grep -q "$INSTALL_DIR" "$HOME/.zshrc" 2>/dev/null; then
+    printf "\n# Added by Cloneable\n%s\n" "$export_line" >> "$HOME/.zshrc"
+    muted "Updated ~/.zshrc"
+    added=1
   fi
 
-  local shell_config=""
-  case "$SHELL" in
-    */zsh)  shell_config="$HOME/.zshrc" ;;
-    */fish) shell_config="$HOME/.config/fish/config.fish" ;;
-    *)      shell_config="$HOME/.bashrc" ;;
-  esac
+  # fish
+  local fish_cfg="$HOME/.config/fish/config.fish"
+  if [ -f "$fish_cfg" ] && ! grep -q "$INSTALL_DIR" "$fish_cfg" 2>/dev/null; then
+    printf "\n# Added by Cloneable\n%s\n" "$fish_line" >> "$fish_cfg"
+    muted "Updated $fish_cfg"
+    added=1
+  fi
 
-  if [ -n "$shell_config" ] && ! grep -q "$INSTALL_DIR" "$shell_config" 2>/dev/null; then
-    echo "" >> "$shell_config"
-    echo "# Added by Cloneable installer" >> "$shell_config"
-    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_config"
-    muted "Added $INSTALL_DIR to PATH in $shell_config"
-    muted "Restart your terminal or run: source $shell_config"
+  # .profile (POSIX fallback, covers dash, sh, etc.)
+  if [ -f "$HOME/.profile" ] && ! grep -q "$INSTALL_DIR" "$HOME/.profile" 2>/dev/null; then
+    printf "\n# Added by Cloneable\n%s\n" "$export_line" >> "$HOME/.profile"
+    muted "Updated ~/.profile"
+    added=1
+  fi
+
+  # If nothing was found at all, print a manual instruction
+  if [ "$added" -eq 0 ] && ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
+    muted "Add this to your shell config manually:"
+    muted "  $export_line"
+  fi
+
+  if [ "$added" -gt 0 ]; then
+    muted ""
+    muted "Restart your terminal (or run: source ~/.bashrc) to use cloneable."
   fi
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   printf "\n"
   printf "  ${SAFFRON}Installing Cloneable${RESET}\n"
@@ -115,24 +128,17 @@ main() {
   local os arch version
   os="$(detect_os)"
   arch="$(detect_arch)"
-
   info "Detected: ${os}/${arch}"
 
   version="$(fetch_latest_version)"
-  if [ -z "$version" ]; then
-    error "Could not fetch latest version from GitHub"
-  fi
+  [ -z "$version" ] && error "Could not fetch latest version"
 
   download_binary "$version" "$os" "$arch"
   ensure_in_path
 
   printf "\n"
-  success "Cloneable v${version} installed to ${INSTALL_DIR}/${BINARY}"
-  printf "\n"
-  muted "Usage:"
-  muted "  cloneable https://github.com/user/repo"
-  muted "  cloneable search ghostty"
-  muted "  cloneable --help"
+  success "Cloneable v${version} installed"
+  muted "Binary: ${INSTALL_DIR}/${BINARY}"
   printf "\n"
 }
 

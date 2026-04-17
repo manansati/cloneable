@@ -17,10 +17,9 @@ var (
 	colorDark    = lipgloss.Color("#3A3A3A")
 	colorGreen   = lipgloss.Color("#00E676")
 
-	styleSelectedBg   = lipgloss.NewStyle().Background(colorSaffron).Foreground(lipgloss.Color("#000000")).Bold(true)
-	styleSelectedName = lipgloss.NewStyle().Background(colorSaffron).Foreground(lipgloss.Color("#000000")).Bold(true).PaddingLeft(1)
-	styleNormalName   = lipgloss.NewStyle().Foreground(colorWhite).Bold(true).PaddingLeft(2)
-	styleDesc         = lipgloss.NewStyle().Foreground(colorGray).PaddingLeft(2)
+	styleSelectedRow  = lipgloss.NewStyle().Background(colorSaffron).Foreground(lipgloss.Color("#000000")).Bold(true)
+	styleNormalName   = lipgloss.NewStyle().Foreground(colorWhite).Bold(true)
+	styleDesc         = lipgloss.NewStyle().Foreground(colorGray)
 	styleMeta         = lipgloss.NewStyle().Foreground(colorGray)
 	styleStars        = lipgloss.NewStyle().Foreground(colorSaffron)
 	styleLang         = lipgloss.NewStyle().Foreground(colorGreen)
@@ -31,7 +30,6 @@ var (
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
-// SearchModel is the bubbletea model for the search results screen.
 type SearchModel struct {
 	query      string
 	results    []SearchResult
@@ -39,14 +37,15 @@ type SearchModel struct {
 	cursor     int
 	chosen     *SearchResult
 	cancelled  bool
+	height     int // terminal height for viewport clipping
 }
 
-// NewSearchModel creates a search model ready to render.
 func NewSearchModel(query string, results []SearchResult, total int) SearchModel {
 	return SearchModel{
 		query:      query,
 		results:    results,
 		totalCount: total,
+		cursor:     0, // always start at top
 	}
 }
 
@@ -54,6 +53,9 @@ func (m SearchModel) Init() tea.Cmd { return nil }
 
 func (m SearchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -88,78 +90,79 @@ func (m SearchModel) View() string {
 
 	var b strings.Builder
 
-	// Header
+	// Header line
 	b.WriteString("\n  ")
-	b.WriteString(styleHeader.Render("Search results for: "))
+	b.WriteString(styleHeader.Render("Results for: "))
 	b.WriteString(lipgloss.NewStyle().Foreground(colorWhite).Bold(true).Render(`"` + m.query + `"`))
-	b.WriteString(styleMeta.Render(fmt.Sprintf("  (%s total)", FormatStars(m.totalCount))))
+	b.WriteString(styleMeta.Render(fmt.Sprintf("  (%s repos)", FormatStars(m.totalCount))))
 	b.WriteString("\n\n")
 
 	divider := "  " + styleDivider.Render(strings.Repeat("─", 66))
 	b.WriteString(divider + "\n")
 
-	// Results
 	for i, r := range m.results {
 		selected := i == m.cursor
 
+		var row string
 		if selected {
-			// Highlighted row
-			b.WriteString("  " + styleSelectedBg.Render(" › ") + " ")
-			b.WriteString(styleSelectedName.Render(r.FullName))
+			// Full row highlight — arrow + name + meta all highlighted
+			name := fmt.Sprintf(" › %s", r.FullName)
+			meta := buildMeta(r)
+			if meta != "" {
+				row = styleSelectedRow.Render(fmt.Sprintf("  %-40s %s  ", name, meta))
+			} else {
+				row = styleSelectedRow.Render(fmt.Sprintf("  %-40s  ", name))
+			}
+			b.WriteString(row + "\n")
 		} else {
-			b.WriteString("    ")
-			b.WriteString(styleNormalName.Render(r.FullName))
-		}
-
-		// Stars + language + updated
-		meta := ""
-		if r.Stars > 0 {
-			meta += styleStars.Render("★ "+FormatStars(r.Stars))
-		}
-		if r.Language != "" {
+			b.WriteString("    " + styleNormalName.Render(r.FullName))
+			meta := buildMeta(r)
 			if meta != "" {
-				meta += styleMeta.Render("  ")
+				b.WriteString("  " + meta)
 			}
-			meta += styleLang.Render(r.Language)
-		}
-		updated := FormatUpdated(r.UpdatedAt)
-		if updated != "" {
-			if meta != "" {
-				meta += styleMeta.Render("  ")
-			}
-			meta += styleMeta.Render(updated)
-		}
-		if meta != "" {
-			b.WriteString("  " + meta)
-		}
-		b.WriteString("\n")
-
-		// Description
-		if r.Description != "" {
-			b.WriteString(styleDesc.Render(TruncateDesc(r.Description, 72)))
 			b.WriteString("\n")
+		}
+
+		if r.Description != "" {
+			b.WriteString("    " + styleDesc.Render(TruncateDesc(r.Description, 70)) + "\n")
 		}
 
 		b.WriteString(divider + "\n")
 	}
 
-	// Key hints
 	b.WriteString("\n  ")
-	b.WriteString(styleHint.Render("↑/↓  navigate    enter  clone + install + launch    q  quit"))
+	b.WriteString(styleHint.Render("↑/↓  navigate    enter  select    q  quit"))
 	b.WriteString("\n\n")
 
 	return b.String()
 }
 
-// RunSearchUI shows the arrow-key search results list.
-// Returns the selected result, or nil if cancelled.
+func buildMeta(r SearchResult) string {
+	var parts []string
+	if r.Stars > 0 {
+		parts = append(parts, styleStars.Render("★ "+FormatStars(r.Stars)))
+	}
+	if r.Language != "" {
+		parts = append(parts, styleLang.Render(r.Language))
+	}
+	updated := FormatUpdated(r.UpdatedAt)
+	if updated != "" {
+		parts = append(parts, styleMeta.Render(updated))
+	}
+	return strings.Join(parts, "  ")
+}
+
+// RunSearchUI shows the search results in an alt-screen so it always starts
+// at the top of the terminal, not pushed to the bottom.
 func RunSearchUI(query string, results []SearchResult, total int) (*SearchResult, error) {
 	if len(results) == 0 {
 		return nil, nil
 	}
 
 	model := NewSearchModel(query, results, total)
-	p := tea.NewProgram(model)
+
+	// WithAltScreen puts the UI in a full-screen mode — cursor always at top
+	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	final, err := p.Run()
 	if err != nil {

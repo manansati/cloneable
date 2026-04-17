@@ -215,10 +215,5 @@ func (p *PkgManagerInfo) DisplayName() string {
 	if p.Primary == PkgUnknown {
 		return "no package manager found"
 	}
-	name := string(p.Primary)
-	// Show the first community manager alongside primary if present
-	if len(p.Community) > 0 && p.Community[0] != PkgSnap && p.Community[0] != PkgFlatpak {
-		name += " + " + string(p.Community[0])
-	}
-	return name
+	return string(p.Primary)
 }

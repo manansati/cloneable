@@ -12,11 +12,11 @@ func (a *Apk) IsInstalled(pkg string) bool {
 }
 
 func (a *Apk) UpdateIndex(log LogWriter) error {
-	return run(log, "apk", "update")
+	return sudoRun(log, "apk", "update")
 }
 
 func (a *Apk) Install(pkg string, log LogWriter) error {
-	return run(log, "apk", "add", "--no-cache", pkg)
+	return sudoRun(log, "apk", "add", "--no-cache", pkg)
 }
 
 func (a *Apk) InstallSelf(log LogWriter) error {

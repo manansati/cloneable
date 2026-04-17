@@ -18,7 +18,7 @@ func (s *Snap) UpdateIndex(log LogWriter) error {
 }
 
 func (s *Snap) Install(pkg string, log LogWriter) error {
-	return run(log, "snap", "install", pkg)
+	return sudoRun(log, "snap", "install", pkg)
 }
 
 // InstallSelf installs snapd via apt/dnf if it's not already present.

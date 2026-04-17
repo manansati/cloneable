@@ -107,6 +107,10 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	cascade := pkgmanager.NewCascade(ctx.OSInfo, ctx.PkgInfo)
 
 	if len(profile.SystemDeps) > 0 {
+		// Authenticate sudo upfront so the password prompt doesn't get swallowed by the spinner
+		// or trigger multiple times during individual package installs.
+		_ = pkgmanager.AuthenticateSudo()
+
 		sysErr := ui.RunWithSpinner("Installing system dependencies", func() error {
 			if log != nil {
 				log.Section("System Dependencies")
@@ -246,7 +250,7 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 
 func installNode(repoPath string, environment *env.Environment, log pkgmanager.LogWriter) error {
 	// Ensure the right package manager is installed (pnpm/yarn if needed)
-	if err := environment.EnsurePackageManager(log); err != nil {
+	if err := environment.EnsurePackageManager(env.LogWriter(log)); err != nil {
 		return err
 	}
 

@@ -13,11 +13,11 @@ func (d *Dnf) IsInstalled(pkg string) bool {
 
 func (d *Dnf) UpdateIndex(log LogWriter) error {
 	// dnf automatically refreshes metadata on install — explicit check is optional
-	return run(log, "dnf", "check-update", "--assumeyes")
+	return sudoRun(log, "dnf", "check-update", "--assumeyes")
 }
 
 func (d *Dnf) Install(pkg string, log LogWriter) error {
-	return run(log, "dnf", "install", "-y", pkg)
+	return sudoRun(log, "dnf", "install", "-y", pkg)
 }
 
 func (d *Dnf) InstallSelf(log LogWriter) error {

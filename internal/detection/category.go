@@ -316,7 +316,7 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 		return []string{"pip", "install", "."}
 	case TechCpp, TechC:
 		if fileExists(repoPath, "CMakeLists.txt") {
-			return []string{"cmake", "--install", "."}
+			return []string{"cmake", "--install", "build"}
 		}
 		return []string{"make", "install"}
 	case TechZig:

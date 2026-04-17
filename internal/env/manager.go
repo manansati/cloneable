@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/manansati/cloneable/internal/detection"
+	"github.com/manansati/cloneable/internal/ui"
 )
 
 // Environment represents an isolated environment for a single repository.
@@ -107,7 +109,7 @@ func (e *Environment) MakeGlobal(globalBinaryName string, log LogWriter) error {
 	}
 
 	// Find the binary source path
-	source, err := e.findBinary(globalBinaryName)
+	source, err := e.FindBinary(globalBinaryName)
 	if err != nil {
 		return err
 	}
@@ -139,26 +141,83 @@ func (e *Environment) MakeGlobal(globalBinaryName string, log LogWriter) error {
 	return nil
 }
 
-// EnsureBinDirInPath checks if BinDir is in the user's PATH and prints
-// a helpful message if not. Does not modify PATH automatically — too risky.
+// EnsureBinDirInPath writes PATH exports to every shell config found on this system.
+// It covers bash, zsh, fish, and POSIX .profile — all at once.
 func (e *Environment) EnsureBinDirInPath() {
 	pathEnv := os.Getenv("PATH")
 	if isInPath(e.BinDir, pathEnv) {
 		return
 	}
 
-	// Print shell-specific instruction
-	switch detectShell() {
-	case "fish":
-		fmt.Printf("\n  Add Cloneable's bin dir to your PATH:\n")
-		fmt.Printf("  fish_add_path %s\n\n", e.BinDir)
-	case "zsh":
-		fmt.Printf("\n  Add to your ~/.zshrc:\n")
-		fmt.Printf("  export PATH=\"%s:$PATH\"\n\n", e.BinDir)
-	default: // bash and others
-		fmt.Printf("\n  Add to your ~/.bashrc or ~/.profile:\n")
-		fmt.Printf("  export PATH=\"%s:$PATH\"\n\n", e.BinDir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
 	}
+
+	exportLine := fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", e.BinDir)
+	fishLine := fmt.Sprintf("\n# Cloneable\nfish_add_path %s\n", e.BinDir)
+
+	type cfg struct {
+		path string
+		line string
+	}
+
+	configs := []cfg{
+		{filepath.Join(home, ".bashrc"), exportLine},
+		{filepath.Join(home, ".bash_profile"), exportLine},
+		{filepath.Join(home, ".zshrc"), exportLine},
+		{filepath.Join(home, ".profile"), exportLine},
+		{filepath.Join(home, ".config", "fish", "config.fish"), fishLine},
+	}
+
+	added := false
+	for _, c := range configs {
+		if !fileExists(c.path) {
+			continue
+		}
+		if fileContains(c.path, e.BinDir) {
+			continue
+		}
+		if err := appendToFile(c.path, c.line); err == nil {
+			added = true
+		}
+	}
+
+	if !added {
+		// Print manual instruction using the active shell syntax
+		switch detectShell() {
+		case "fish":
+			fmt.Printf("\n  Add to PATH:  fish_add_path %s\n\n", e.BinDir)
+		default:
+			fmt.Printf("\n  Add to PATH:  export PATH=\"%s:$PATH\"\n\n", e.BinDir)
+		}
+	} else {
+		fmt.Printf("\n  %s  Added %s to your shell configs.\n", ui.Tick(), ui.Muted(e.BinDir))
+		fmt.Printf("  %s  %s\n\n", ui.Warn("!"), ui.SaffronBold("Restart your terminal to apply."))
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func fileContains(path, str string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), str)
+}
+
+func appendToFile(path, content string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(content)
+	return err
 }
 
 // RemoveAll removes the isolated environment and all symlinks.

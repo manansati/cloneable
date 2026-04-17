@@ -244,9 +244,6 @@ func EnsureDirectories(info *OSInfo) error {
 func (info *OSInfo) DisplayName() string {
 	switch info.Type {
 	case OSLinux:
-		if info.Distro != DistroUnknown && info.Distro != "" {
-			return string(info.Distro)
-		}
 		return "Linux"
 	case OSMacOS:
 		return "macOS"

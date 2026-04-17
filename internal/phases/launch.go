@@ -122,7 +122,7 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 			result.BinaryName = ctx.RepoName
 
 			// Make symlink if needed (Python, Node, C/C++)
-			_ = environment.MakeGlobal(ctx.RepoName, safeLog())
+			_ = environment.MakeGlobal(ctx.RepoName, env.LogWriter(safeLog()))
 			environment.EnsureBinDirInPath()
 
 			fmt.Printf("\n  %s  %s installed globally\n",
@@ -132,12 +132,11 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 	}
 
 	// ── Launch / Run ─────────────────────────────────────────────────────────
-	runErr := ui.RunWithSpinner("Launching", func() error {
-		if log != nil {
-			log.Section("Launch")
-		}
-		return launchProject(ctx, profile, environment, safeLog())
-	})
+	fmt.Printf("\n  %s  Launching\n\n", ui.Tick())
+	if log != nil {
+		log.Section("Launch")
+	}
+	runErr := launchProject(ctx, profile, environment, safeLog())
 	if runErr != nil {
 		// Dependency error during launch? Phase II retry.
 		if isDependencyError(runErr) {
@@ -239,6 +238,14 @@ func launchProject(ctx LaunchContext, profile *detection.TechProfile, environmen
 		return launchScripts(repoPath, log)
 	}
 
+	// For C/C++ projects, find the built binary instead of relying on 'make run'
+	if profile.Primary == detection.TechCpp || profile.Primary == detection.TechC {
+		binPath, err := environment.FindBinary(ctx.RepoName)
+		if err == nil {
+			profile.RunCommands = []string{binPath}
+		}
+	}
+
 	// For CLI tools that need arguments — show arg selector UI
 	if profile.Category == detection.CategoryCLI {
 		return launchCLI(ctx, profile, extraEnv, log)
@@ -248,7 +255,7 @@ func launchProject(ctx LaunchContext, profile *detection.TechProfile, environmen
 	if len(profile.RunCommands) == 0 {
 		return fmt.Errorf("no run command found for %s — try adding a cloneable.yaml", ctx.RepoName)
 	}
-	return runIn(repoPath, log, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+	return runInteractive(repoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 }
 
 // launchCLI runs a CLI tool, showing an arg-selector UI first.
@@ -265,7 +272,7 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 
 	if len(opts) == 0 {
 		// No parseable help — just run it directly
-		return runIn(ctx.RepoPath, log, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Show arrow-key selector
@@ -275,30 +282,30 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 	)
 	if err != nil || choice == nil {
 		// Cancelled — run without args
-		return runIn(ctx.RepoPath, log, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Custom argument
 	if choice.Value == "__custom__" {
 		// TODO: show a text input — for now use the run command directly
-		return runIn(ctx.RepoPath, log, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Run with the selected argument
 	cmdArgs := append(profile.RunCommands[1:], choice.Value)
-	return runIn(ctx.RepoPath, log, extraEnv, profile.RunCommands[0], cmdArgs...)
+	return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], cmdArgs...)
 }
 
 // launchDotfiles applies dotfiles using stow, chezmoi, or install scripts.
 func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 	// Strategy 1: chezmoi
 	if fileExists(repoPath, ".chezmoi.yaml") || fileExists(repoPath, ".chezmoi.toml") {
-		return runIn(repoPath, log, nil, "chezmoi", "apply")
+		return runInteractive(repoPath, nil, "chezmoi", "apply")
 	}
 
 	// Strategy 2: GNU stow
 	if commandExists("stow") && (fileExists(repoPath, ".stow-local-ignore") || hasDotfileDirs(repoPath)) {
-		return runIn(repoPath, log, nil, "stow", ".")
+		return runInteractive(repoPath, nil, "stow", ".")
 	}
 
 	// Strategy 3: install.sh / setup.sh
@@ -306,7 +313,7 @@ func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 		scriptPath := filepath.Join(repoPath, script)
 		if isExec(scriptPath) {
 			_ = os.Chmod(scriptPath, 0755)
-			return runIn(repoPath, log, nil, scriptPath)
+			return runInteractive(repoPath, nil, scriptPath)
 		}
 	}
 
@@ -317,14 +324,14 @@ func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 func launchDocs(repoPath string, log pkgmanager.LogWriter) error {
 	// Try glow (Charm's markdown renderer)
 	if commandExists("glow") {
-		return runIn(repoPath, log, nil, "glow", ".")
+		return runInteractive(repoPath, nil, "glow", ".")
 	}
 	// Try mdcat
 	if commandExists("mdcat") {
 		readmeFiles := []string{"README.md", "readme.md", "README", "docs/index.md"}
 		for _, f := range readmeFiles {
 			if fileExists(repoPath, f) {
-				return runIn(repoPath, log, nil, "mdcat", filepath.Join(repoPath, f))
+				return runInteractive(repoPath, nil, "mdcat", filepath.Join(repoPath, f))
 			}
 		}
 	}
@@ -344,17 +351,17 @@ func launchDocs(repoPath string, log pkgmanager.LogWriter) error {
 // launchDocker runs the project using docker-compose or docker run.
 func launchDocker(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "docker-compose.yml") {
-		return runIn(repoPath, log, nil, "docker-compose", "up")
+		return runInteractive(repoPath, nil, "docker-compose", "up")
 	}
 	if fileExists(repoPath, "docker-compose.yaml") {
-		return runIn(repoPath, log, nil, "docker-compose", "-f", "docker-compose.yaml", "up")
+		return runInteractive(repoPath, nil, "docker-compose", "-f", "docker-compose.yaml", "up")
 	}
 	if fileExists(repoPath, "Dockerfile") {
 		repoName := filepath.Base(repoPath)
 		if err := runIn(repoPath, log, nil, "docker", "build", "-t", repoName, "."); err != nil {
 			return err
 		}
-		return runIn(repoPath, log, nil, "docker", "run", repoName)
+		return runInteractive(repoPath, nil, "docker", "run", repoName)
 	}
 	return fmt.Errorf("no docker-compose.yml or Dockerfile found")
 }
@@ -366,7 +373,7 @@ func launchScripts(repoPath string, log pkgmanager.LogWriter) error {
 		scriptPath := filepath.Join(repoPath, name)
 		if isExec(scriptPath) || fileExists(repoPath, name) {
 			_ = os.Chmod(scriptPath, 0755)
-			return runIn(repoPath, log, nil, "bash", scriptPath)
+			return runInteractive(repoPath, nil, "bash", scriptPath)
 		}
 	}
 	// Fall back to the first .sh file found
@@ -378,7 +385,7 @@ func launchScripts(repoPath string, log pkgmanager.LogWriter) error {
 		if strings.HasSuffix(entry.Name(), ".sh") {
 			scriptPath := filepath.Join(repoPath, entry.Name())
 			_ = os.Chmod(scriptPath, 0755)
-			return runIn(repoPath, log, nil, "bash", scriptPath)
+			return runInteractive(repoPath, nil, "bash", scriptPath)
 		}
 	}
 	return fmt.Errorf("no shell script found to run")
@@ -426,11 +433,9 @@ func runFromSpec(ctx LaunchContext, spec *detection.CloneableSpec, log *logger.L
 
 	// Run
 	if spec.Run != "" {
-		runErr := ui.RunWithSpinner("Launching", func() error {
-			parts := strings.Fields(spec.Run)
-			return runIn(ctx.RepoPath, safeLog(), nil, parts[0], parts[1:]...)
-		})
-		return &LaunchResult{}, runErr
+		parts := strings.Fields(spec.Run)
+		fmt.Printf("\n  %s  Launching\n\n", ui.Tick())
+		return &LaunchResult{}, runInteractive(ctx.RepoPath, nil, parts[0], parts[1:]...)
 	}
 
 	return &LaunchResult{}, nil
@@ -601,4 +606,16 @@ func isExec(path string) bool {
 		return false
 	}
 	return info.Mode()&0111 != 0
+}
+
+// runInteractive runs a command with stdin/stdout/stderr connected to the host terminal.
+// This is required for interactive CLI tools (like btop, vim, etc.).
+func runInteractive(dir string, extraEnv []string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

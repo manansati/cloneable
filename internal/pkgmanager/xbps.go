@@ -12,11 +12,11 @@ func (x *Xbps) IsInstalled(pkg string) bool {
 }
 
 func (x *Xbps) UpdateIndex(log LogWriter) error {
-	return run(log, "xbps-install", "-S")
+	return sudoRun(log, "xbps-install", "-S")
 }
 
 func (x *Xbps) Install(pkg string, log LogWriter) error {
-	return run(log, "xbps-install", "-Sy", pkg)
+	return sudoRun(log, "xbps-install", "-Sy", pkg)
 }
 
 func (x *Xbps) InstallSelf(log LogWriter) error {

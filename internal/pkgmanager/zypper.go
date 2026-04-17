@@ -12,11 +12,11 @@ func (z *Zypper) IsInstalled(pkg string) bool {
 }
 
 func (z *Zypper) UpdateIndex(log LogWriter) error {
-	return run(log, "zypper", "--non-interactive", "refresh")
+	return sudoRun(log, "zypper", "--non-interactive", "refresh")
 }
 
 func (z *Zypper) Install(pkg string, log LogWriter) error {
-	return run(log, "zypper", "--non-interactive", "install", pkg)
+	return sudoRun(log, "zypper", "--non-interactive", "install", pkg)
 }
 
 func (z *Zypper) InstallSelf(log LogWriter) error {

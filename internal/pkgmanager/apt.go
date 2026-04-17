@@ -13,11 +13,11 @@ func (a *Apt) IsInstalled(pkg string) bool {
 }
 
 func (a *Apt) UpdateIndex(log LogWriter) error {
-	return run(log, "apt-get", "update", "-y")
+	return sudoRun(log, "apt-get", "update", "-y")
 }
 
 func (a *Apt) Install(pkg string, log LogWriter) error {
-	return run(log,
+	return sudoRun(log,
 		"apt-get", "install", "-y",
 		"--no-install-recommends",
 		pkg,

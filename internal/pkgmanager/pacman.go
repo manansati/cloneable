@@ -13,11 +13,11 @@ func (p *Pacman) IsInstalled(pkg string) bool {
 }
 
 func (p *Pacman) UpdateIndex(log LogWriter) error {
-	return run(log, "pacman", "-Sy", "--noconfirm")
+	return sudoRun(log, "pacman", "-Sy", "--noconfirm")
 }
 
 func (p *Pacman) Install(pkg string, log LogWriter) error {
-	return run(log, "pacman", "-S", "--noconfirm", "--needed", pkg)
+	return sudoRun(log, "pacman", "-S", "--noconfirm", "--needed", pkg)
 }
 
 func (p *Pacman) InstallSelf(log LogWriter) error {

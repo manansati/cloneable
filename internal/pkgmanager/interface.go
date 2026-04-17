@@ -5,7 +5,9 @@ package pkgmanager
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -82,4 +84,37 @@ func commandExists(name string) bool {
 // a more accurate query where possible.
 func packageInstalled(binary string) bool {
 	return commandExists(binary)
+}
+
+// needsSudo returns true if the current process is not running as root.
+// On Windows, sudo is not used — package managers handle elevation themselves.
+func needsSudo() bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	return os.Getuid() != 0
+}
+
+// AuthenticateSudo runs 'sudo -v' to prompt the user for their password upfront.
+// This prevents multiple sudo prompts or prompts hidden behind a spinner.
+func AuthenticateSudo() error {
+	if !needsSudo() {
+		return nil
+	}
+	cmd := exec.Command("sudo", "-v")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// sudoRun executes a command with sudo prepended if not running as root.
+// Used by system package managers that require root privileges (apt, pacman, etc.).
+// sudo reads the password from /dev/tty, so it works even during spinner animations.
+func sudoRun(logWriter LogWriter, name string, args ...string) error {
+	if needsSudo() {
+		args = append([]string{name}, args...)
+		name = "sudo"
+	}
+	return run(logWriter, name, args...)
 }

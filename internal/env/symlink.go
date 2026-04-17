@@ -5,22 +5,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// findBinary searches for the compiled/installed binary in well-known locations.
-// It checks in this order:
-//  1. The isolated env bin dir (e.g. .venv/bin/, zig-out/bin/)
-//  2. The repo root
-//  3. Common build output dirs (build/, dist/, target/release/, bin/)
-func (e *Environment) findBinary(name string) (string, error) {
+// FindBinary searches for the compiled/installed binary in well-known locations.
+func (e *Environment) FindBinary(name string) (string, error) {
 	candidates := e.binarySearchPaths(name)
 
 	for _, path := range candidates {
 		if isExecutable(path) {
 			return path, nil
 		}
-		// Windows: also try with .exe suffix
 		if isExecutable(path + ".exe") {
 			return path + ".exe", nil
 		}
@@ -33,15 +29,13 @@ func (e *Environment) findBinary(name string) (string, error) {
 	)
 }
 
-// binarySearchPaths returns all paths to check for the binary, in priority order.
 func (e *Environment) binarySearchPaths(name string) []string {
 	var paths []string
 
-	// 1. Language-specific output directories
-	switch e.Tech.String() {
+	switch string(e.Tech) {
 	case "Python":
 		binDir := filepath.Join(e.RepoPath, ".venv", "bin")
-		if isWindows() {
+		if runtime.GOOS == "windows" {
 			binDir = filepath.Join(e.RepoPath, ".venv", "Scripts")
 		}
 		paths = append(paths, filepath.Join(binDir, name))
@@ -75,7 +69,6 @@ func (e *Environment) binarySearchPaths(name string) []string {
 		paths = append(paths,
 			filepath.Join(e.RepoPath, "build", name),
 			filepath.Join(e.RepoPath, "build", "bin", name),
-			// cmake --install puts things in installPrefix/bin
 			filepath.Join(e.installPrefix(), "bin", name),
 		)
 
@@ -85,7 +78,7 @@ func (e *Environment) binarySearchPaths(name string) []string {
 		)
 	}
 
-	// 2. Generic search paths — checked for all techs as fallback
+	// Generic fallbacks for all techs
 	generic := []string{
 		filepath.Join(e.RepoPath, name),
 		filepath.Join(e.RepoPath, "bin", name),
@@ -96,12 +89,10 @@ func (e *Environment) binarySearchPaths(name string) []string {
 		filepath.Join(e.RepoPath, "release", name),
 		filepath.Join(e.EnvDir, name),
 	}
-
 	paths = append(paths, generic...)
 	return paths
 }
 
-// isExecutable returns true if the path exists and is executable.
 func isExecutable(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -110,34 +101,25 @@ func isExecutable(path string) bool {
 	if info.IsDir() {
 		return false
 	}
-	if isWindows() {
-		// On Windows, any existing file with .exe/.cmd/.bat is executable
+	if runtime.GOOS == "windows" {
 		return true
 	}
-	// Unix: check executable bit
 	return info.Mode()&0111 != 0
 }
 
-// createWindowsWrapper creates a .cmd file that invokes the source binary.
-// This gives Windows users a globally-accessible command without needing
-// Unix symlinks (which require admin rights on older Windows versions).
 func createWindowsWrapper(source, target string, log LogWriter) error {
 	content := fmt.Sprintf("@echo off\n\"%s\" %%*\n", source)
-
 	if err := os.WriteFile(target, []byte(content), 0755); err != nil {
 		return fmt.Errorf("could not create Windows wrapper %s: %w", target, err)
 	}
-
 	if log != nil {
 		log(fmt.Sprintf("[env] created Windows wrapper: %s → %s", source, target))
 	}
 	return nil
 }
 
-// AddToPATHWindows adds the given directory to the user's PATH on Windows
-// via the registry. This persists after the terminal closes.
+// AddToPATHWindows adds a directory to the user's PATH permanently via registry.
 func AddToPATHWindows(dir string, log LogWriter) error {
-	// Read current user PATH from registry
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		fmt.Sprintf(`[Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";%s", "User")`, dir),
 	)
@@ -151,41 +133,78 @@ func AddToPATHWindows(dir string, log LogWriter) error {
 	return nil
 }
 
-// AddToPATHUnix appends a PATH export line to the user's shell config file.
-// It detects the shell and writes to the right file.
-// Only adds if not already present.
+// AddToPATHUnix writes the PATH export to shell config files for ALL detected shells.
+// It writes to every rc file that exists — not just the active shell.
 func AddToPATHUnix(dir string, log LogWriter) error {
-	shell := detectShell()
-	configFile := shellConfigFile(shell)
-
-	if configFile == "" {
-		return nil // Unknown shell — don't touch anything
-	}
-
-	// Read existing content
-	existing, _ := os.ReadFile(configFile)
-	exportLine := fmt.Sprintf(`export PATH="%s:$PATH"`, dir)
-
-	// Already present?
-	if strings.Contains(string(existing), dir) {
-		return nil
-	}
-
-	// Append to config file
-	f, err := os.OpenFile(configFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	_, err = fmt.Fprintf(f, "\n# Added by Cloneable\n%s\n", exportLine)
-	if log != nil {
-		log(fmt.Sprintf("[env] added %s to %s", dir, configFile))
+	type shellCfg struct {
+		path    string
+		line    string
+		mkdirOf string // parent dir to create if needed
 	}
-	return err
+
+	configs := []shellCfg{
+		{
+			path: filepath.Join(home, ".bashrc"),
+			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
+		},
+		{
+			path: filepath.Join(home, ".bash_profile"),
+			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
+		},
+		{
+			path: filepath.Join(home, ".zshrc"),
+			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
+		},
+		{
+			path:    filepath.Join(home, ".config", "fish", "config.fish"),
+			line:    fmt.Sprintf("\n# Cloneable\nfish_add_path %s\n", dir),
+			mkdirOf: filepath.Join(home, ".config", "fish"),
+		},
+		{
+			path: filepath.Join(home, ".profile"),
+			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
+		},
+	}
+
+	written := 0
+	for _, cfg := range configs {
+		// Only write to files that already exist (don't create rc files for shells not installed)
+		if _, err := os.Stat(cfg.path); os.IsNotExist(err) {
+			continue
+		}
+
+		// Skip if already contains the path
+		data, _ := os.ReadFile(cfg.path)
+		if strings.Contains(string(data), dir) {
+			continue
+		}
+
+		// Write
+		if cfg.mkdirOf != "" {
+			_ = os.MkdirAll(cfg.mkdirOf, 0755)
+		}
+		f, err := os.OpenFile(cfg.path, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			continue
+		}
+		_, _ = f.WriteString(cfg.line)
+		f.Close()
+		written++
+
+		if log != nil {
+			log(fmt.Sprintf("[env] updated %s", cfg.path))
+		}
+	}
+
+	_ = written
+	return nil
 }
 
-// isInPath returns true if the given directory is already in the PATH string.
 func isInPath(dir, pathEnv string) bool {
 	sep := string(os.PathListSeparator)
 	for _, p := range strings.Split(pathEnv, sep) {
@@ -196,17 +215,14 @@ func isInPath(dir, pathEnv string) bool {
 	return false
 }
 
-// detectShell returns the name of the current shell (bash, zsh, fish, etc.).
 func detectShell() string {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		return "bash"
 	}
-	base := filepath.Base(shell)
-	return base
+	return filepath.Base(shell)
 }
 
-// shellConfigFile returns the config file path for the given shell.
 func shellConfigFile(shell string) string {
 	home, _ := os.UserHomeDir()
 	switch shell {
@@ -215,7 +231,6 @@ func shellConfigFile(shell string) string {
 	case "fish":
 		return filepath.Join(home, ".config", "fish", "config.fish")
 	case "bash":
-		// Prefer .bashrc, but .bash_profile on macOS
 		bashrc := filepath.Join(home, ".bashrc")
 		if _, err := os.Stat(bashrc); err == nil {
 			return bashrc
@@ -224,8 +239,4 @@ func shellConfigFile(shell string) string {
 	default:
 		return filepath.Join(home, ".profile")
 	}
-}
-
-func isWindows() bool {
-	return os.Getenv("OS") == "Windows_NT"
 }

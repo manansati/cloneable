@@ -26,7 +26,8 @@ Example:
 	SilenceUsage: true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runClone(args[0], git.DuplicateAsk)
+		_, err := runClone(args[0], git.DuplicateAsk)
+		return err
 	},
 }
 
