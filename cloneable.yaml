@@ -1,0 +1,11 @@
+# cloneable.yaml — Cloneable's own spec
+# This makes Cloneable installable via: cloneable https://github.com/manansati/cloneable
+
+name: cloneable
+version: 0.1.0
+type: go
+depends_on: [git]
+build: go build -ldflags "-s -w" -o cloneable .
+install: go install ./...
+run: ./cloneable --help
+global_binary: cloneable
