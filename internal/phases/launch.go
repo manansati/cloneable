@@ -1,18 +1,25 @@
 package phases
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/manansati/cloneable/internal/detection"
 	"github.com/manansati/cloneable/internal/env"
+	"github.com/manansati/cloneable/internal/git"
 	"github.com/manansati/cloneable/internal/logger"
 	"github.com/manansati/cloneable/internal/pkgmanager"
 	"github.com/manansati/cloneable/internal/ui"
 )
+
+// NOTE: Launching and Installing logic is split between two files:
+// 1. internal/phases/install.go: Handles Phase II (Detection, Environment Setup, System/Language Dependencies)
+// 2. internal/phases/launch.go: Handles Phase III (Building, Global Installation, and Launching/Running)
 
 // LaunchContext holds everything Phase III needs.
 type LaunchContext struct {
@@ -58,6 +65,12 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 			if log != nil {
 				log.Section("Build")
 			}
+			// Bulletproof: ensure submodules are present before building
+			_ = git.EnsureSubmodules(ctx.RepoPath, func(s string) {
+				if log != nil {
+					log.Write(s)
+				}
+			})
 			return buildProject(ctx.RepoPath, profile, environment, safeLog())
 		})
 		if buildErr != nil {
@@ -87,58 +100,128 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 		}
 	}
 
-	// ── Global install confirmation ───────────────────────────────────────────
-	if isInstallable(profile.Primary, profile.Category) && !ctx.GlobalInstall {
-		opts := ui.GlobalInstallOptions(ctx.RepoName)
-		choice, err := ui.RunSelector(
-			fmt.Sprintf("How would you like to install %s?", ui.SaffronBold(ctx.RepoName)),
-			opts,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if choice != nil && choice.Value == "global" {
-			ctx.GlobalInstall = true
-		}
-	}
-
-	// ── Global install ────────────────────────────────────────────────────────
-	if ctx.GlobalInstall && len(profile.InstallCommands) > 0 {
+	// ── Global install — always, no confirmation needed ───────────────────────
+	if isInstallable(profile.Primary, profile.Category) && len(profile.InstallCommands) > 0 {
+		var usedPipx bool
 		installErr := ui.RunWithSpinner("Installing globally", func() error {
 			if log != nil {
 				log.Section("Global Install")
 			}
-			return runIn(ctx.RepoPath, safeLog(), environment.GoEnvVars(),
+			extraEnv := envVarsForTech(profile.Primary, environment)
+			// Try without sudo first — most install commands now target ~/.local
+			err := runIn(ctx.RepoPath, safeLog(), extraEnv,
 				profile.InstallCommands[0], profile.InstallCommands[1:]...)
+			if err != nil {
+				// Python fallback: if pip install fails (e.g. PEP 668), use pipx
+				if profile.Primary == detection.TechPython {
+					if log != nil {
+						log.Write("[install] pip install failed (possibly PEP 668) — retrying with pipx")
+					}
+					usedPipx = true
+					err = runIn(ctx.RepoPath, safeLog(), extraEnv, "pipx", "install", "--force", ".")
+				} else {
+					// Fallback: retry with sudo for commands that need /usr/local
+					if log != nil {
+						log.Write("[install] non-root install failed — retrying with sudo")
+					}
+					err = runInSudo(ctx.RepoPath, safeLog(), extraEnv,
+						profile.InstallCommands[0], profile.InstallCommands[1:]...)
+				}
+			}
+			return err
 		})
 		if installErr != nil {
 			if log != nil {
 				log.Error(installErr)
 			}
-			// Non-fatal — fall through to local run
-			fmt.Printf("\n  %s  Global install failed — running locally instead\n", ui.Warn("!"))
-		} else {
-			result.InstalledGlobally = true
-			result.BinaryName = ctx.RepoName
-
-			// Make symlink if needed (Python, Node, C/C++)
-			_ = environment.MakeGlobal(ctx.RepoName, env.LogWriter(safeLog()))
-			environment.EnsureBinDirInPath()
-
-			fmt.Printf("\n  %s  %s installed globally\n",
-				ui.Tick(), ui.SaffronBold(ctx.RepoName))
+			// Non-fatal — tell user and skip launch (don't try to run what failed to install)
+			fmt.Printf("\n  %s  Global install failed.\n", ui.Warn("!"))
+			fmt.Printf("  %s  Check install.logs for details.\n\n", ui.Muted("→"))
 			return result, nil
 		}
+
+		result.InstalledGlobally = true
+		result.BinaryName = ctx.RepoName
+
+		// Make it global (creates symlink in ~/.local/bin)
+		// For Python, if pipx was used, it automatically creates the symlink in ~/.local/bin, so we skip manual linking.
+		if !usedPipx {
+			if err := environment.MakeGlobal(ctx.RepoName, env.LogWriter(safeLog())); err != nil {
+				if log != nil {
+					log.Write("[launch] warning: MakeGlobal failed: " + err.Error())
+				}
+			}
+		}
+		environment.EnsureBinDirInPath()
+
+		fmt.Printf("\n  %s  %s installed globally\n",
+			ui.Tick(), ui.SaffronBold(ctx.RepoName))
+
+		if profile.Primary == detection.TechPython {
+			activateCmd := "source cloneable-activate.sh"
+			if runtime.GOOS == "windows" {
+				activateCmd = "cloneable-activate.bat"
+			}
+			fmt.Printf("  %s  To manually use the environment: %s\n",
+				ui.Muted("→"), ui.Saffron(activateCmd))
+		}
+
+		// For compiled native apps (C, C++, Zig, Rust, Go, Haskell):
+		// the binary is now in PATH — just tell the user how to run it.
+		if isNativeCompiled(profile.Primary) {
+			// Find the actual binary name (might be different from repo name, e.g. neovim -> nvim)
+			binPath, err := environment.FindBinary(ctx.RepoName)
+			actualName := ctx.RepoName
+			if err == nil {
+				actualName = filepath.Base(binPath)
+				result.BinaryName = actualName
+			}
+
+			fmt.Printf("  %s  Run it with: %s\n\n",
+				ui.Muted("→"), ui.SaffronBold(actualName))
+
+			// Ask if they want to open it right now
+			shouldOpen, _ := ui.Confirm(fmt.Sprintf("Launch %s now?", actualName))
+			if !shouldOpen {
+				return result, nil
+			}
+
+			if err != nil {
+				// Discovery failed — check if it's in PATH now
+				if _, pathErr := exec.LookPath(actualName); pathErr != nil {
+					return result, fmt.Errorf("could not find binary %q in search paths", actualName)
+				}
+				binPath = actualName
+			}
+
+			fmt.Println()
+			launchErr := runInteractive(ctx.RepoPath, nil, binPath)
+			// CLI tools commonly exit with code 1 or 2 when invoked without
+			// arguments (they print usage and exit non-zero). This is expected
+			// behavior — the tool IS installed and working. Don't report it
+			// as an error.
+			if launchErr != nil && isCLIUsageExit(launchErr) {
+				return result, nil
+			}
+			return result, launchErr
+		}
+
+		// For interpreted apps (Python, Node, etc.) — ask to open
+		shouldOpen, _ := ui.Confirm(fmt.Sprintf("Open %s now?", ctx.RepoName))
+		if !shouldOpen {
+			return result, nil
+		}
+		// Fall through to launch section
 	}
 
 	// ── Launch / Run ─────────────────────────────────────────────────────────
-	fmt.Printf("\n  %s  Launching\n\n", ui.Tick())
+	// Only reached for interpreted languages or when no install command exists.
 	if log != nil {
 		log.Section("Launch")
 	}
 	runErr := launchProject(ctx, profile, environment, safeLog())
 	if runErr != nil {
-		// Dependency error during launch? Phase II retry.
+		// Dependency error? Retry Phase II once.
 		if isDependencyError(runErr) {
 			if log != nil {
 				log.Write("[launch] dependency error at runtime — retrying Phase II")
@@ -176,13 +259,25 @@ func needsBuild(tech detection.TechType) bool {
 	return false
 }
 
+// isNativeCompiled returns true for languages that produce a standalone binary.
+// For these, after `make install` / `zig build install`, the binary is in PATH
+// and should be run directly — not with `zig build run` or `make run`.
+func isNativeCompiled(tech detection.TechType) bool {
+	switch tech {
+	case detection.TechGo, detection.TechRust, detection.TechZig,
+		detection.TechCpp, detection.TechC, detection.TechHaskell:
+		return true
+	}
+	return false
+}
+
 // isInstallable returns true for repos that should offer a global install.
 func isInstallable(tech detection.TechType, cat detection.RepoCategory) bool {
 	if cat == detection.CategoryDotfiles || cat == detection.CategoryDocs {
 		return false
 	}
 	switch tech {
-	case detection.TechDotfile, detection.TechDocs, detection.TechScripts:
+	case detection.TechDotfile, detection.TechDocs:
 		return false
 	}
 	return true
@@ -198,12 +293,13 @@ func buildProject(repoPath string, profile *detection.TechProfile, environment *
 
 	switch profile.Primary {
 	case detection.TechCpp, detection.TechC:
-		// cmake --build or make — run in the build/ directory
-		buildDir := filepath.Join(repoPath, "build")
-		return runIn(buildDir, log, extraEnv, profile.BuildCommands[0], profile.BuildCommands[1:]...)
+		return buildCpp(repoPath, log, extraEnv)
+
+	case detection.TechZig:
+		// Zig: just run `zig build` in the repo root
+		return runIn(repoPath, log, extraEnv, "zig", "build")
 
 	case detection.TechJava:
-		// Fix wrapper permissions first
 		for _, wrapper := range []string{"gradlew", "mvnw"} {
 			wp := filepath.Join(repoPath, wrapper)
 			if _, err := os.Stat(wp); err == nil {
@@ -216,6 +312,82 @@ func buildProject(repoPath string, profile *detection.TechProfile, environment *
 		return runIn(repoPath, log, extraEnv, profile.BuildCommands[0], profile.BuildCommands[1:]...)
 	}
 }
+
+// buildCpp handles the configure + build two-step for C/C++ projects.
+// Configure runs here (NOT in setupCpp) because system deps must be
+// installed before configure can succeed.
+//
+// cmake: cmake -B build -S . → cmake --build build
+// meson: meson setup build  → meson compile -C build
+// autotools: autoreconf → ./configure → make
+// make: make (in repo root)
+func buildCpp(repoPath string, log pkgmanager.LogWriter, extraEnv []string) error {
+	buildDir := filepath.Join(repoPath, "build")
+	home, _ := os.UserHomeDir()
+	prefix := filepath.Join(home, ".local")
+
+	// Ensure build directory exists
+	_ = os.MkdirAll(buildDir, 0755)
+
+	if fileExistsAbs(filepath.Join(repoPath, "CMakeLists.txt")) {
+		// Step 1: configure — always re-run to pick up newly installed deps
+		if err := runIn(repoPath, log, extraEnv,
+			"cmake", "-B", buildDir, "-S", repoPath,
+			"-DCMAKE_BUILD_TYPE=Release",
+			fmt.Sprintf("-DCMAKE_INSTALL_PREFIX=%s", prefix),
+		); err != nil {
+			return fmt.Errorf("cmake configure failed: %w", err)
+		}
+		// Step 2: build
+		return runIn(repoPath, log, extraEnv, "cmake", "--build", buildDir, "--parallel")
+	}
+
+	if fileExistsAbs(filepath.Join(repoPath, "meson.build")) {
+		// Check if meson was already configured
+		if !fileExistsAbs(filepath.Join(buildDir, "build.ninja")) {
+			if err := runIn(repoPath, log, extraEnv,
+				"meson", "setup", buildDir, repoPath,
+				"--buildtype=release",
+				fmt.Sprintf("--prefix=%s", prefix),
+			); err != nil {
+				return fmt.Errorf("meson setup failed: %w", err)
+			}
+		}
+		return runIn(repoPath, log, extraEnv, "meson", "compile", "-C", buildDir)
+	}
+
+	if fileExistsAbs(filepath.Join(repoPath, "configure.ac")) && !fileExistsAbs(filepath.Join(repoPath, "configure")) {
+		// Need to generate configure script first
+		if err := runIn(repoPath, log, extraEnv, "autoreconf", "-fi"); err != nil {
+			// Try autogen.sh as fallback
+			if fileExistsAbs(filepath.Join(repoPath, "autogen.sh")) {
+				_ = os.Chmod(filepath.Join(repoPath, "autogen.sh"), 0755)
+				_ = runIn(repoPath, log, extraEnv, "./autogen.sh")
+			}
+		}
+	}
+
+	if fileExistsAbs(filepath.Join(repoPath, "configure")) {
+		_ = os.Chmod(filepath.Join(repoPath, "configure"), 0755)
+		if err := runIn(repoPath, log, extraEnv, "./configure", fmt.Sprintf("--prefix=%s", prefix)); err != nil {
+			return err
+		}
+		return runIn(repoPath, log, extraEnv, "make", "-j4")
+	}
+
+	// Plain Makefile
+	if fileExistsAbs(filepath.Join(repoPath, "Makefile")) || fileExistsAbs(filepath.Join(repoPath, "GNUmakefile")) {
+		return runIn(repoPath, log, extraEnv, "make", "-j4")
+	}
+
+	return fmt.Errorf("no recognised C/C++ build system found (tried cmake, meson, configure, make)")
+}
+
+func fileExistsAbs(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 
@@ -238,12 +410,17 @@ func launchProject(ctx LaunchContext, profile *detection.TechProfile, environmen
 		return launchScripts(repoPath, log)
 	}
 
-	// For C/C++ projects, find the built binary instead of relying on 'make run'
-	if profile.Primary == detection.TechCpp || profile.Primary == detection.TechC {
+	// For native compiled languages — find the binary by name instead of using RunCommands
+	if isNativeCompiled(profile.Primary) {
 		binPath, err := environment.FindBinary(ctx.RepoName)
 		if err == nil {
-			profile.RunCommands = []string{binPath}
+			// Run it interactively
+			return runInteractive(repoPath, extraEnv, binPath)
 		}
+		// Binary not found in expected locations — tell the user
+		fmt.Printf("\n  %s  %s is installed — run it from your terminal: %s\n\n",
+			ui.Tick(), ctx.RepoName, ui.SaffronBold(ctx.RepoName))
+		return nil
 	}
 
 	// For CLI tools that need arguments — show arg selector UI
@@ -297,64 +474,90 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 }
 
 // launchDotfiles applies dotfiles using stow, chezmoi, or install scripts.
+// Never prints README — only applies configs.
 func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 	// Strategy 1: chezmoi
 	if fileExists(repoPath, ".chezmoi.yaml") || fileExists(repoPath, ".chezmoi.toml") {
+		fmt.Printf("\n  %s  Applying dotfiles with chezmoi...\n\n", ui.Saffron("→"))
 		return runInteractive(repoPath, nil, "chezmoi", "apply")
 	}
 
 	// Strategy 2: GNU stow
 	if commandExists("stow") && (fileExists(repoPath, ".stow-local-ignore") || hasDotfileDirs(repoPath)) {
-		return runInteractive(repoPath, nil, "stow", ".")
+		fmt.Printf("\n  %s  Applying dotfiles with stow...\n\n", ui.Saffron("→"))
+		return runInteractive(repoPath, nil, "stow", "--target", os.Getenv("HOME"), ".")
 	}
 
 	// Strategy 3: install.sh / setup.sh
-	for _, script := range []string{"install.sh", "setup.sh", "bootstrap.sh", "install"} {
+	for _, script := range []string{"install.sh", "setup.sh", "bootstrap.sh"} {
 		scriptPath := filepath.Join(repoPath, script)
-		if isExec(scriptPath) {
+		if _, err := os.Stat(scriptPath); err == nil {
 			_ = os.Chmod(scriptPath, 0755)
-			return runInteractive(repoPath, nil, scriptPath)
+			fmt.Printf("\n  %s  Running %s...\n\n", ui.Saffron("→"), script)
+			return runInteractive(repoPath, nil, "bash", scriptPath)
 		}
 	}
 
-	return fmt.Errorf("could not determine how to apply dotfiles — no stow, chezmoi, or install.sh found")
+	// Strategy 4: show what's in the repo — don't print files, just tell user
+	fmt.Printf("\n  %s  Dotfiles cloned to: %s\n", ui.Tick(), ui.SaffronBold(repoPath))
+	fmt.Printf("  %s  No automatic installer found (no stow, chezmoi, or install.sh).\n", ui.Muted("→"))
+	fmt.Printf("  %s  Copy the config files you need manually.\n\n", ui.Muted("→"))
+	return nil
 }
 
-// launchDocs renders a markdown file or doc site in the terminal.
+// launchDocs renders a markdown file beautifully in the terminal.
+// Strategy: try glow (best) → mdcat → built-in renderer (always available).
 func launchDocs(repoPath string, log pkgmanager.LogWriter) error {
-	// Try glow (Charm's markdown renderer)
+	// Find the best markdown file to display
+	mdFile := ""
+	for _, candidate := range []string{
+		"README.md", "readme.md", "README.markdown",
+		"docs/README.md", "docs/index.md",
+		"DOCS.md", "docs.md",
+		"GUIDE.md", "guide.md",
+	} {
+		if fileExists(repoPath, candidate) {
+			mdFile = filepath.Join(repoPath, candidate)
+			break
+		}
+	}
+
+	if mdFile == "" {
+		fmt.Printf("\n  %s  Documentation cloned to: %s\n", ui.Tick(), ui.SaffronBold(repoPath))
+		fmt.Printf("  %s  No README.md found — browse the files manually.\n\n", ui.Muted("→"))
+		return nil
+	}
+
+	shouldRender, _ := ui.Confirm(fmt.Sprintf("No runnable application detected. Read %s?", filepath.Base(mdFile)))
+	if !shouldRender {
+		fmt.Printf("\n  %s  Documentation cloned to: %s\n\n", ui.Tick(), ui.SaffronBold(repoPath))
+		return nil
+	}
+
+	fmt.Printf("\n  %s  Rendering %s\n\n", ui.Tick(), ui.SaffronBold(filepath.Base(mdFile)))
+
+	// Strategy 1: glow (Charm's markdown renderer) — best output
 	if commandExists("glow") {
-		return runInteractive(repoPath, nil, "glow", ".")
+		return runInteractive(repoPath, nil, "glow", mdFile)
 	}
-	// Try mdcat
+
+	// Strategy 2: mdcat
 	if commandExists("mdcat") {
-		readmeFiles := []string{"README.md", "readme.md", "README", "docs/index.md"}
-		for _, f := range readmeFiles {
-			if fileExists(repoPath, f) {
-				return runInteractive(repoPath, nil, "mdcat", filepath.Join(repoPath, f))
-			}
-		}
+		return runInteractive(repoPath, nil, "mdcat", mdFile)
 	}
-	// Fallback: cat the README
-	for _, f := range []string{"README.md", "readme.md", "README.txt", "README"} {
-		if fileExists(repoPath, f) {
-			content, err := os.ReadFile(filepath.Join(repoPath, f))
-			if err == nil {
-				fmt.Println(string(content))
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("no documentation file found to display")
+
+	// Strategy 3: built-in renderer (always works, no external tools needed)
+	return ui.RenderMarkdown(mdFile)
 }
 
-// launchDocker runs the project using docker-compose or docker run.
+// launchDocker runs the project using docker compose (v2 plugin) or docker-compose (standalone).
 func launchDocker(repoPath string, log pkgmanager.LogWriter) error {
+	compose := resolveDockerCompose()
 	if fileExists(repoPath, "docker-compose.yml") {
-		return runInteractive(repoPath, nil, "docker-compose", "up")
+		return runInteractive(repoPath, nil, compose[0], append(compose[1:], "up")...)
 	}
 	if fileExists(repoPath, "docker-compose.yaml") {
-		return runInteractive(repoPath, nil, "docker-compose", "-f", "docker-compose.yaml", "up")
+		return runInteractive(repoPath, nil, compose[0], append(compose[1:], "-f", "docker-compose.yaml", "up")...)
 	}
 	if fileExists(repoPath, "Dockerfile") {
 		repoName := filepath.Base(repoPath)
@@ -368,6 +571,15 @@ func launchDocker(repoPath string, log pkgmanager.LogWriter) error {
 
 // launchScripts finds and runs the main shell script in the repo.
 func launchScripts(repoPath string, log pkgmanager.LogWriter) error {
+	repoName := filepath.Base(repoPath)
+
+	// First check if there's a file matching the repo name (e.g. neofetch)
+	if fileExists(repoPath, repoName) {
+		scriptPath := filepath.Join(repoPath, repoName)
+		_ = os.Chmod(scriptPath, 0755)
+		return runInteractive(repoPath, nil, "bash", scriptPath)
+	}
+
 	// Look for common entry-point scripts
 	for _, name := range []string{"main.sh", "run.sh", "start.sh", "install.sh"} {
 		scriptPath := filepath.Join(repoPath, name)
@@ -423,7 +635,7 @@ func runFromSpec(ctx LaunchContext, spec *detection.CloneableSpec, log *logger.L
 		if choice != nil && choice.Value == "global" {
 			installErr := ui.RunWithSpinner("Installing globally", func() error {
 				parts := strings.Fields(spec.Install)
-				return runIn(ctx.RepoPath, safeLog(), nil, parts[0], parts[1:]...)
+				return runInSudo(ctx.RepoPath, safeLog(), nil, parts[0], parts[1:]...)
 			})
 			if installErr == nil {
 				return &LaunchResult{InstalledGlobally: true, BinaryName: spec.GlobalBin}, nil
@@ -473,17 +685,16 @@ func envVarsForTech(tech detection.TechType, environment *env.Environment) []str
 }
 
 // isDependencyError returns true if the error looks like a missing dependency.
+// This is intentionally strict — only clear signals of missing packages/modules
+// trigger a Phase II retry. Generic strings like "not found" or "missing" are
+// excluded because they match too many legitimate build errors.
 func isDependencyError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	signals := []string{
-		"no such file or directory",
 		"command not found",
-		"cannot find",
-		"not found",
-		"missing",
 		"module not found",
 		"cannot load",
 		"importerror",
@@ -491,6 +702,9 @@ func isDependencyError(err error) bool {
 		"cannot find module",
 		"error while loading shared libraries",
 		"library not found",
+		"package not found",
+		"could not resolve dependencies",
+		"unresolved import",
 	}
 	for _, s := range signals {
 		if strings.Contains(msg, s) {
@@ -506,7 +720,8 @@ func getHelpOutput(repoPath string, runCmds []string, extraEnv []string) string 
 	if len(runCmds) == 0 {
 		return ""
 	}
-	cmd := exec.Command(runCmds[0], append(runCmds[1:], "--help")...)
+	name := env.ResolveExecutable(runCmds[0])
+	cmd := exec.Command(name, append(runCmds[1:], "--help")...)
 	cmd.Dir = repoPath
 	cmd.Env = append(os.Environ(), extraEnv...)
 	out, _ := cmd.CombinedOutput()
@@ -611,6 +826,7 @@ func isExec(path string) bool {
 // runInteractive runs a command with stdin/stdout/stderr connected to the host terminal.
 // This is required for interactive CLI tools (like btop, vim, etc.).
 func runInteractive(dir string, extraEnv []string, name string, args ...string) error {
+	name = env.ResolveExecutable(name)
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
@@ -618,4 +834,36 @@ func runInteractive(dir string, extraEnv []string, name string, args ...string) 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func showTail(path string, lines int) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	allLines := strings.Split(string(data), "\n")
+	start := len(allLines) - lines
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(allLines); i++ {
+		line := allLines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fmt.Printf("    %s\n", ui.Muted(line))
+	}
+}
+
+// isCLIUsageExit returns true if the error is an ExitError with code 1 or 2.
+// CLI tools commonly exit with these codes when run without arguments —
+// they print their usage/help and exit non-zero. This is expected behaviour
+// for utilities like zoxide, ripgrep, fd, etc. after a successful install.
+func isCLIUsageExit(err error) bool {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		return code == 1 || code == 2
+	}
+	return false
 }

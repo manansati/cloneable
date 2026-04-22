@@ -57,8 +57,7 @@ Example:
 		})
 		if err != nil {
 			if result != nil && result.Log != nil {
-				fmt.Printf("\n  %s  See install.logs: %s\n",
-					ui.Warn("!"), result.Log.LogPath)
+				return fmt.Errorf("%w\n\n  %s  See install.logs: %s", err, ui.Warn("!"), result.Log.LogPath)
 			}
 			return err
 		}

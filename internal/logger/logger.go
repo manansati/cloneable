@@ -97,3 +97,13 @@ func ReadAll(repoPath string) (string, error) {
 	}
 	return string(data), nil
 }
+
+// NewRaw creates a Logger writing to an arbitrary file path (not necessarily inside a repo).
+// Used for pre-clone logging where the repo dir doesn't exist yet.
+func NewRaw(path string) (*Logger, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &Logger{file: f, LogPath: path}, nil
+}

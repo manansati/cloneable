@@ -41,7 +41,7 @@ Examples:
 			ui.SaffronBold(query))
 
 		// Fetch results
-		results, total, err := gh.SearchRepos(query)
+		results, total, err := gh.SearchRepos(query, 1)
 		if err != nil {
 			return err
 		}

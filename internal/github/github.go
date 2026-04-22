@@ -1,5 +1,4 @@
 // Package github provides lightweight access to the GitHub REST API.
-// No SDK — just net/http. Respects GITHUB_TOKEN for higher rate limits.
 package github
 
 import (
@@ -8,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -18,21 +16,20 @@ const (
 	userAgent = "cloneable-cli/1.0"
 )
 
-// client is a minimal GitHub API client.
+// ── Client ────────────────────────────────────────────────────────────────────
+
 type client struct {
 	http  *http.Client
 	token string
 }
 
-// newClient creates a client, picking up GITHUB_TOKEN from the environment.
 func newClient() *client {
 	return &client{
-		http:  &http.Client{Timeout: 8 * time.Second},
-		token: os.Getenv("GITHUB_TOKEN"),
+		http:  &http.Client{Timeout: 10 * time.Second},
+		token: GetToken(), // reads env var or config file
 	}
 }
 
-// get performs a GET request and decodes the JSON response into dest.
 func (c *client) get(endpoint string, dest interface{}) error {
 	req, err := http.NewRequest("GET", baseURL+endpoint, nil)
 	if err != nil {
@@ -58,13 +55,18 @@ func (c *client) get(endpoint string, dest interface{}) error {
 		return err
 	}
 
-	// Handle rate limit
+	// Rate limit hit
 	if resp.StatusCode == 403 || resp.StatusCode == 429 {
-		return fmt.Errorf(
-			"GitHub API rate limit reached\n\n" +
-				"  Set GITHUB_TOKEN for 5,000 requests/hour:\n" +
-				"  export GITHUB_TOKEN=your_token_here\n",
-		)
+		hasToken := c.token != ""
+		if hasToken {
+			return &RateLimitError{HasToken: true}
+		}
+		return &RateLimitError{HasToken: false}
+	}
+
+	// Not found — treat as empty, not error (e.g. repo has no releases)
+	if resp.StatusCode == 404 {
+		return &NotFoundError{}
 	}
 
 	if resp.StatusCode != 200 {
@@ -74,78 +76,185 @@ func (c *client) get(endpoint string, dest interface{}) error {
 	return json.Unmarshal(body, dest)
 }
 
+// ── Error types ───────────────────────────────────────────────────────────────
+
+// RateLimitError is returned when the GitHub API rate limit is hit.
+type RateLimitError struct {
+	HasToken bool
+}
+
+func (e *RateLimitError) Error() string {
+	if e.HasToken {
+		return "rate_limit_with_token"
+	}
+	return "rate_limit_no_token"
+}
+
+// NotFoundError is returned when a resource is not found (404).
+type NotFoundError struct{}
+
+func (e *NotFoundError) Error() string { return "not_found" }
+
+// IsRateLimit returns true if the error is a rate limit error.
+func IsRateLimit(err error) bool {
+	_, ok := err.(*RateLimitError)
+	return ok
+}
+
+// IsNotFound returns true if the error is a 404.
+func IsNotFound(err error) bool {
+	_, ok := err.(*NotFoundError)
+	return ok
+}
+
 // ── Search ────────────────────────────────────────────────────────────────────
 
-// SearchResult holds a single repository returned by the search API.
 type SearchResult struct {
-	FullName    string `json:"full_name"`    // e.g. "neovim/neovim"
-	Description string `json:"description"`  // e.g. "Vim-fork focused on extensibility"
-	HTMLURL     string `json:"html_url"`     // GitHub web URL
-	CloneURL    string `json:"clone_url"`    // HTTPS clone URL
-	Stars       int    `json:"stargazers_count"`
-	Language    string `json:"language"`     // primary language
-	UpdatedAt   string `json:"updated_at"`   // ISO 8601 timestamp
+	FullName    string   `json:"full_name"`
+	Description string   `json:"description"`
+	HTMLURL     string   `json:"html_url"`
+	CloneURL    string   `json:"clone_url"`
+	Stars       int      `json:"stargazers_count"`
+	Language    string   `json:"language"`
+	UpdatedAt   string   `json:"updated_at"`
 	Topics      []string `json:"topics"`
 }
 
-// searchResponse is the top-level shape of the GitHub search API response.
 type searchResponse struct {
 	TotalCount int            `json:"total_count"`
 	Items      []SearchResult `json:"items"`
 }
 
-// SearchRepos searches GitHub for repositories matching the query.
-// Returns up to 20 results sorted by stars (best match).
-func SearchRepos(query string) ([]SearchResult, int, error) {
+// perPage returns how many results to fetch based on whether we have a token.
+func perPage() int {
+	if GetToken() != "" {
+		return 100
+	}
+	return 30
+}
+
+func SearchRepos(query string, page int) ([]SearchResult, int, error) {
 	c := newClient()
+	
+	// Improve fuzzy search for popular repos:
+	// If it's a single word without special qualifiers and long enough, append a truncated OR fallback.
+	runes := []rune(query)
+	if !strings.Contains(query, " ") && len(runes) >= 4 && !strings.Contains(query, ":") {
+		shortened := string(runes[:len(runes)-1])
+		query = fmt.Sprintf("%s OR %s in:name", query, shortened)
+	}
 
 	q := url.QueryEscape(query)
 	endpoint := fmt.Sprintf(
-		"/search/repositories?q=%s&sort=stars&order=desc&per_page=20",
-		q,
+		"/search/repositories?q=%s&per_page=%d&page=%d",
+		q, perPage(), page,
 	)
-
 	var resp searchResponse
 	if err := c.get(endpoint, &resp); err != nil {
-		return nil, 0, err
+		return nil, 0, handleAPIError(err)
 	}
+	return resp.Items, resp.TotalCount, nil
+}
 
+func ExploreTrending(query string, page int) ([]SearchResult, int, error) {
+	c := newClient()
+	q := url.QueryEscape(query)
+	endpoint := fmt.Sprintf(
+		"/search/repositories?q=%s&sort=stars&order=desc&per_page=%d&page=%d",
+		q, perPage(), page,
+	)
+	var resp searchResponse
+	if err := c.get(endpoint, &resp); err != nil {
+		return nil, 0, handleAPIError(err)
+	}
 	return resp.Items, resp.TotalCount, nil
 }
 
 // ── Language stats ────────────────────────────────────────────────────────────
 
-// LangStats maps language name → byte count.
 type LangStats map[string]int
 
-// FetchLanguages fetches the language breakdown for owner/repo from the
-// GitHub API. Does not clone the repo.
 func FetchLanguages(owner, repo string) (LangStats, error) {
 	c := newClient()
 	var stats LangStats
 	endpoint := fmt.Sprintf("/repos/%s/%s/languages", owner, repo)
 	if err := c.get(endpoint, &stats); err != nil {
-		return nil, err
+		return nil, handleAPIError(err)
 	}
 	return stats, nil
 }
 
+// ── Latest release ────────────────────────────────────────────────────────────
+
+type releaseResponse struct {
+	TagName string `json:"tag_name"`
+	Message string `json:"message"` // GitHub error message field
+}
+
+// FetchLatestVersion returns the latest release version, or "" if no releases exist.
+func FetchLatestVersion(repo string) (string, error) {
+	c := newClient()
+	var rel releaseResponse
+	err := c.get("/repos/"+repo+"/releases/latest", &rel)
+	if err != nil {
+		if IsNotFound(err) {
+			return "", nil // No releases yet — not an error
+		}
+		return "", err
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), nil
+}
+
+// ── handleAPIError ────────────────────────────────────────────────────────────
+
+// handleAPIError checks if it's a rate limit and if so, prompts for a token.
+// If the user provides a token, it retries the original call.
+// This is the central place for rate limit handling so every caller benefits.
+func handleAPIError(err error) error {
+	if !IsRateLimit(err) {
+		return err
+	}
+
+	rl := err.(*RateLimitError)
+
+	if rl.HasToken {
+		// Already have a token and still rate limited — token exhausted
+		return fmt.Errorf(
+			"GitHub API rate limit reached (even with your token)\n\n" +
+				"  You've made too many requests. Wait ~1 hour and try again.\n",
+		)
+	}
+
+	// No token — prompt for one
+	reason := "GitHub API rate limit reached (60 requests/hour without a token).\n\n" +
+		"  With a free token you get 5,000 requests/hour.\n" +
+		"  Without a token, please wait ~1 hour before trying again."
+
+	token := PromptForToken(reason)
+	if token == "" {
+		return fmt.Errorf(
+			"GitHub rate limit reached\n\n" +
+				"  No token provided. Please wait ~1 hour, or add a GITHUB_TOKEN.\n",
+		)
+	}
+
+	// Token provided — the caller will retry naturally on next invocation
+	// (since GetToken() will now return the saved token)
+	return fmt.Errorf("token saved — please run your command again")
+}
+
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-// LangBar represents a single language row in the stats display.
 type LangBar struct {
 	Name    string
 	Bytes   int
 	Percent float64
 }
 
-// ToSortedBars converts LangStats to a slice of LangBars sorted by byte count descending.
 func (ls LangStats) ToSortedBars() []LangBar {
 	if len(ls) == 0 {
 		return nil
 	}
-
-	// Total bytes
 	total := 0
 	for _, b := range ls {
 		total += b
@@ -153,7 +262,6 @@ func (ls LangStats) ToSortedBars() []LangBar {
 	if total == 0 {
 		return nil
 	}
-
 	bars := make([]LangBar, 0, len(ls))
 	for name, bytes := range ls {
 		bars = append(bars, LangBar{
@@ -162,8 +270,6 @@ func (ls LangStats) ToSortedBars() []LangBar {
 			Percent: float64(bytes) / float64(total) * 100,
 		})
 	}
-
-	// Sort descending by bytes
 	for i := 0; i < len(bars); i++ {
 		for j := i + 1; j < len(bars); j++ {
 			if bars[j].Bytes > bars[i].Bytes {
@@ -171,12 +277,9 @@ func (ls LangStats) ToSortedBars() []LangBar {
 			}
 		}
 	}
-
 	return bars
 }
 
-// FormatStars returns a compact star count string.
-// e.g. 1234 → "1.2k"   12345 → "12k"   1234567 → "1.2m"
 func FormatStars(n int) string {
 	switch {
 	case n >= 1_000_000:
@@ -188,7 +291,6 @@ func FormatStars(n int) string {
 	}
 }
 
-// FormatUpdated returns a short relative time string from an ISO timestamp.
 func FormatUpdated(iso string) string {
 	if iso == "" {
 		return ""
@@ -212,13 +314,11 @@ func FormatUpdated(iso string) string {
 	}
 }
 
-// TruncateDesc truncates a description to maxLen characters cleanly.
 func TruncateDesc(s string, maxLen int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= maxLen {
 		return s
 	}
-	// Trim at word boundary
 	trimmed := s[:maxLen]
 	if idx := strings.LastIndex(trimmed, " "); idx > maxLen-15 {
 		trimmed = trimmed[:idx]

@@ -32,64 +32,84 @@ func (e *Environment) FindBinary(name string) (string, error) {
 func (e *Environment) binarySearchPaths(name string) []string {
 	var paths []string
 
-	switch string(e.Tech) {
-	case "Python":
-		binDir := filepath.Join(e.RepoPath, ".venv", "bin")
-		if runtime.GOOS == "windows" {
-			binDir = filepath.Join(e.RepoPath, ".venv", "Scripts")
-		}
-		paths = append(paths, filepath.Join(binDir, name))
-
-	case "Node.js":
-		paths = append(paths,
-			filepath.Join(e.RepoPath, "node_modules", ".bin", name),
-			filepath.Join(e.RepoPath, "bin", name),
-		)
-
-	case "Zig":
-		paths = append(paths,
-			filepath.Join(e.RepoPath, "zig-out", "bin", name),
-		)
-
-	case "Rust":
-		paths = append(paths,
-			filepath.Join(e.RepoPath, "target", "release", name),
-			filepath.Join(e.RepoPath, "target", "debug", name),
-		)
-
-	case "Go":
-		gopath := os.Getenv("GOPATH")
-		if gopath == "" {
-			home, _ := os.UserHomeDir()
-			gopath = filepath.Join(home, "go")
-		}
-		paths = append(paths, filepath.Join(gopath, "bin", name))
-
-	case "C/C++", "C":
-		paths = append(paths,
-			filepath.Join(e.RepoPath, "build", name),
-			filepath.Join(e.RepoPath, "build", "bin", name),
-			filepath.Join(e.installPrefix(), "bin", name),
-		)
-
-	case "Java":
-		paths = append(paths,
-			filepath.Join(e.RepoPath, "build", "libs", name+".jar"),
-		)
+	// Name mapping for known projects where repo name != binary name
+	names := []string{name}
+	if name == "neovim" {
+		names = append(names, "nvim")
 	}
 
-	// Generic fallbacks for all techs
-	generic := []string{
-		filepath.Join(e.RepoPath, name),
-		filepath.Join(e.RepoPath, "bin", name),
-		filepath.Join(e.RepoPath, "dist", name),
-		filepath.Join(e.RepoPath, "dist", "bin", name),
-		filepath.Join(e.RepoPath, "out", name),
-		filepath.Join(e.RepoPath, "out", "bin", name),
-		filepath.Join(e.RepoPath, "release", name),
-		filepath.Join(e.EnvDir, name),
+	for _, n := range names {
+		switch string(e.Tech) {
+		case "Python":
+			binDir := filepath.Join(e.RepoPath, ".venv", "bin")
+			if runtime.GOOS == "windows" {
+				binDir = filepath.Join(e.RepoPath, ".venv", "Scripts")
+			}
+			paths = append(paths, filepath.Join(binDir, n))
+
+		case "Node.js":
+			paths = append(paths,
+				filepath.Join(e.RepoPath, "node_modules", ".bin", n),
+				filepath.Join(e.RepoPath, "bin", n),
+			)
+
+		case "Zig":
+			paths = append(paths,
+				filepath.Join(e.RepoPath, "zig-out", "bin", n),
+				filepath.Join(e.RepoPath, "zig-out", n), // some zig versions put it in root
+			)
+
+		case "Rust":
+			paths = append(paths,
+				filepath.Join(e.RepoPath, "target", "release", n),
+				filepath.Join(e.RepoPath, "target", "debug", n),
+			)
+
+		case "Go":
+			gopath := os.Getenv("GOPATH")
+			if gopath == "" {
+				home, _ := os.UserHomeDir()
+				gopath = filepath.Join(home, "go")
+			}
+			paths = append(paths, filepath.Join(gopath, "bin", n))
+
+		case "C/C++", "C":
+			paths = append(paths,
+				filepath.Join(e.RepoPath, "build", n),
+				filepath.Join(e.RepoPath, "build", "bin", n),
+				filepath.Join(e.installPrefix(), "bin", n),
+			)
+
+		case "Java":
+			paths = append(paths,
+				filepath.Join(e.RepoPath, "build", "libs", n+".jar"),
+			)
+		}
+
+		// Generic fallbacks for all techs
+		generic := []string{
+			filepath.Join(e.RepoPath, n),
+			filepath.Join(e.RepoPath, "bin", n),
+			filepath.Join(e.RepoPath, "dist", n),
+			filepath.Join(e.RepoPath, "dist", "bin", n),
+			filepath.Join(e.RepoPath, "out", n),
+			filepath.Join(e.RepoPath, "out", "bin", n),
+			filepath.Join(e.RepoPath, "release", n),
+			filepath.Join(e.EnvDir, n),
+		}
+		paths = append(paths, generic...)
+
+		// System paths (for global installs)
+		if runtime.GOOS != "windows" {
+			paths = append(paths,
+				filepath.Join("/usr/local/bin", n),
+				filepath.Join("/usr/bin", n),
+				filepath.Join("/bin", n),
+				filepath.Join("/opt/bin", n),
+			)
+		}
 	}
-	paths = append(paths, generic...)
+
 	return paths
 }
 
@@ -162,19 +182,22 @@ func AddToPATHUnix(dir string, log LogWriter) error {
 		},
 		{
 			path:    filepath.Join(home, ".config", "fish", "config.fish"),
-			line:    fmt.Sprintf("\n# Cloneable\nfish_add_path %s\n", dir),
+			line:    fmt.Sprintf("\n# Cloneable\nif not contains %s $PATH\n    set -gx PATH %s $PATH\nend\n", dir, dir),
 			mkdirOf: filepath.Join(home, ".config", "fish"),
 		},
 		{
 			path: filepath.Join(home, ".profile"),
 			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
 		},
+		{
+			path: filepath.Join(home, ".kshrc"),
+			line: fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", dir),
+		},
 	}
 
-	written := 0
 	for _, cfg := range configs {
-		// Only write to files that already exist (don't create rc files for shells not installed)
-		if _, err := os.Stat(cfg.path); os.IsNotExist(err) {
+		// Only write to files that already exist or for which we have a reason to believe the shell is present
+		if _, err := os.Stat(cfg.path); os.IsNotExist(err) && cfg.mkdirOf == "" {
 			continue
 		}
 
@@ -188,20 +211,19 @@ func AddToPATHUnix(dir string, log LogWriter) error {
 		if cfg.mkdirOf != "" {
 			_ = os.MkdirAll(cfg.mkdirOf, 0755)
 		}
-		f, err := os.OpenFile(cfg.path, os.O_APPEND|os.O_WRONLY, 0644)
+		
+		f, err := os.OpenFile(cfg.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			continue
 		}
 		_, _ = f.WriteString(cfg.line)
 		f.Close()
-		written++
 
 		if log != nil {
 			log(fmt.Sprintf("[env] updated %s", cfg.path))
 		}
 	}
 
-	_ = written
 	return nil
 }
 

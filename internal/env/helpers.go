@@ -2,13 +2,45 @@ package env
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
+
+// ResolveExecutable finds the absolute path of an executable to avoid PATH cache issues.
+func ResolveExecutable(name string) string {
+	if filepath.IsAbs(name) {
+		return name
+	}
+	if absPath, err := exec.LookPath(name); err == nil {
+		return absPath
+	}
+	
+	home, _ := os.UserHomeDir()
+	commonDirs := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".cargo", "bin"),
+		"/opt/flutter/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+	}
+	
+	for _, dir := range commonDirs {
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return name
+}
 
 // runCmd executes a command, streaming combined output to logWriter.
 // This is the package-level run helper used by all env files.
 func runCmd(log LogWriter, name string, args ...string) error {
+	name = ResolveExecutable(name)
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 

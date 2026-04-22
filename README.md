@@ -11,137 +11,94 @@
  ╚═════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝
 ```
 
-No manual setup. No reading READMEs. Just run it.
-
 ---
 
 ## Install
 
-**Linux / macOS**
+**Linux / macOS** — run in terminal:
 ```sh
-curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sudo sh
 ```
 
-**Windows (PowerShell)**
+**Windows** — run in PowerShell as Administrator:
 ```powershell
 irm https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.ps1 | iex
 ```
+
+That's it. `cloneable` will be available everywhere immediately after install.
+
+> **Already have the source code?** Just run `sudo sh scripts/install.sh` from the repo folder — same result.
 
 ---
 
 ## Usage
 
-| Command | Description |
-|---|---|
-| `cloneable <git-url>` | Clone, install dependencies, and launch |
-| `cloneable` | Run inside an already-cloned repo |
-| `cloneable clone <git-url>` | Clone only (no install, no launch) |
-| `cloneable --run` | Launch the app in the current repo |
-| `cloneable --fix` | Fix broken dependencies and reinstall |
-| `cloneable --stats` | Show language breakdown of current repo |
-| `cloneable stats <git-url>` | Language breakdown without cloning |
-| `cloneable search <query>` | Search GitHub and launch interactively |
-| `cloneable list` | List all Cloneable-managed installs |
-| `cloneable remove <name>` | Remove an install cleanly |
-| `cloneable --logs` | View installation logs |
-| `cloneable update` | Update Cloneable itself |
-| `cloneable --version` | Show version info |
+```
+cloneable <git-url>    Clone, install, and launch a repository
+cloneable              Run inside an already-cloned repository
+
+Commands:
+  clone <url>    Clone only
+  search <query> Search GitHub interactively
+  info [url]     Language breakdown
+  list           List installed repos
+  remove <n>     Remove an installation
+  update         Update Cloneable
+
+Flags:
+  -r, --run      Launch the current repo
+  -f, --fix      Fix broken dependencies
+  -i, --info     Language breakdown (current repo)
+  -l, --logs     View install logs
+  -v, --version  Print version
+  -h, --help     Show help
+```
 
 ---
 
-## Examples
+## For developers — build from source
 
 ```sh
-# Install and launch Neovim from source
-cloneable https://github.com/neovim/neovim
+git clone https://github.com/manansati/cloneable
+cd cloneable
+go mod tidy
+go build -o cloneable .
+sudo mv cloneable /usr/local/bin/cloneable
 
-# Try a terminal tool
-cloneable https://github.com/Peltoche/lsd
-
-# Search for repos
-cloneable search "file manager"
-
-# See what languages a repo uses (no clone needed)
-cloneable stats https://github.com/microsoft/vscode
-
-# Fix a broken install
-cd ~/projects/ghostty
-cloneable --fix
+# Verify
+cloneable --version
 ```
+
+---
+
+## Publishing a release (for maintainers)
+
+Install goreleaser once:
+```sh
+go install github.com/goreleaser/goreleaser/v2@latest
+```
+
+Tag and publish:
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+GITHUB_TOKEN=your_token goreleaser release --clean
+```
+
+After this, the install script will download pre-built binaries automatically — no Go required for users.
 
 ---
 
 ## Supported Technologies
 
-| Language | Install Method |
-|---|---|
-| Go | `go install ./...` |
-| Rust | `cargo install --path .` |
-| Node.js | `npm` / `yarn` / `pnpm` |
-| Python | `pip install` into `.venv` (isolated) |
-| C / C++ | `cmake` / `meson` / `make` |
-| Zig | `zig build install` |
-| Flutter / Dart | `flutter pub get` |
-| Java / Kotlin | `gradle` / `maven` |
-| Ruby | `bundle install` |
-| .NET | `dotnet restore` |
-| Haskell | `stack` / `cabal` |
-| Docker | `docker-compose up` |
-| Dotfiles | `stow` / `chezmoi` / `install.sh` |
-
----
+Go · Rust · Node.js · Python · C/C++ · Zig · Flutter/Dart · Java/Kotlin · Ruby · .NET · Haskell · Docker · Dotfiles
 
 ## Supported Package Managers
 
-**Linux:** apt, dnf, pacman, zypper, apk, xbps, yay, paru, snap, flatpak  
+**Linux:** apt · dnf · pacman · zypper · apk · xbps · yay · paru · snap · flatpak  
 **macOS:** Homebrew (auto-installed if missing)  
-**Windows:** winget, Chocolatey, Scoop
+**Windows:** winget · Chocolatey · Scoop
 
 ---
-
-## Environment Isolation
-
-Cloneable never pollutes your system:
-
-- **Python** → `.venv/` inside the repo, binary symlinked globally
-- **Node.js** → local `node_modules/`, bin symlinked globally
-- **Go** → `go install` (uses `~/go/bin`, already isolated)
-- **Rust** → `cargo install --path .` (uses `~/.cargo/bin`)
-- **C/C++** → installs to `~/.local/` prefix
-
-Run `cloneable remove <name>` to cleanly undo everything.
-
----
-
-## cloneable.yaml
-
-Repo authors can ship a `cloneable.yaml` to give Cloneable exact instructions:
-
-```yaml
-name: myapp
-type: go
-depends_on: [ffmpeg, cmake]
-build: make build
-install: make install
-run: ./myapp
-global_binary: myapp
-```
-
----
-
-## For Developers
-
-```sh
-# Clone and build from source
-git clone https://github.com/manansati/cloneable
-cd cloneable
-go mod tidy
-go build -o cloneable .
-./cloneable --version
-```
-
----
-
-## License
 
 MIT © [manansati](https://github.com/manansati)

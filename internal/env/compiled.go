@@ -23,6 +23,9 @@ func (e *Environment) setupGo(log LogWriter) error {
 		gopath = filepath.Join(home, "go")
 	}
 
+	// Ensure GOPATH/bin exists
+	_ = os.MkdirAll(filepath.Join(gopath, "bin"), 0755)
+
 	if log != nil {
 		log(fmt.Sprintf("[go] GOPATH=%s", gopath))
 	}
@@ -30,9 +33,11 @@ func (e *Environment) setupGo(log LogWriter) error {
 }
 
 // GoEnvVars returns environment variables for running go commands.
+// CGO_ENABLED is left unset so Go auto-detects based on the project.
+// Setting CGO_ENABLED=0 would break any project that uses cgo
+// (SQLite bindings, GUI apps, crypto/x509 on some platforms, etc.).
 func (e *Environment) GoEnvVars() []string {
 	return []string{
-		"CGO_ENABLED=0", // faster builds by default; Phase III enables if needed
 		"GOFLAGS=-mod=mod",
 	}
 }
@@ -93,7 +98,10 @@ func RustBinDir() string {
 // ── C / C++ ───────────────────────────────────────────────────────────────────
 
 // setupCpp prepares a C/C++ build environment.
-// Creates the build directory and sets up cmake/meson build system.
+// IMPORTANT: This only creates the build directory. It does NOT run cmake/meson
+// configure — that happens during the build phase in launch.go, AFTER system
+// dependencies have been installed. Running configure before deps are present
+// causes guaranteed failures.
 func (e *Environment) setupCpp(log LogWriter) error {
 	buildDir := filepath.Join(e.RepoPath, "build")
 	e.EnvDir = buildDir
@@ -102,50 +110,28 @@ func (e *Environment) setupCpp(log LogWriter) error {
 		return fmt.Errorf("could not create build directory: %w", err)
 	}
 
-	// Detect build system and configure
+	// Log which build system we detected — but do NOT configure yet.
 	switch {
 	case fileExistsInRepo(e.RepoPath, "CMakeLists.txt"):
 		if log != nil {
-			log("[c/c++] configuring with cmake")
+			log("[c/c++] CMake detected — will configure during build phase")
 		}
-		return runCmd(log, "cmake",
-			"-B", buildDir,
-			"-S", e.RepoPath,
-			"-DCMAKE_BUILD_TYPE=Release",
-			fmt.Sprintf("-DCMAKE_INSTALL_PREFIX=%s", e.installPrefix()),
-		)
-
 	case fileExistsInRepo(e.RepoPath, "meson.build"):
 		if log != nil {
-			log("[c/c++] configuring with meson")
+			log("[c/c++] Meson detected — will configure during build phase")
 		}
-		return runCmd(log, "meson", "setup",
-			buildDir,
-			e.RepoPath,
-			"--buildtype=release",
-			fmt.Sprintf("--prefix=%s", e.installPrefix()),
-		)
-
 	case fileExistsInRepo(e.RepoPath, "configure.ac") || fileExistsInRepo(e.RepoPath, "configure"):
-		// Autotools
 		if log != nil {
-			log("[c/c++] configuring with autotools")
+			log("[c/c++] Autotools detected — will configure during build phase")
 		}
-		// Run autogen if configure doesn't exist yet
-		if !fileExistsInRepo(e.RepoPath, "configure") {
-			if err := runCmd(log, "./autogen.sh"); err != nil {
-				_ = runCmd(log, "autoreconf", "-fi")
-			}
-		}
-		return runCmd(log, "./configure",
-			fmt.Sprintf("--prefix=%s", e.installPrefix()),
-		)
-
 	case fileExistsInRepo(e.RepoPath, "Makefile") || fileExistsInRepo(e.RepoPath, "GNUmakefile"):
 		if log != nil {
 			log("[c/c++] Makefile found — no separate configuration needed")
 		}
-		return nil
+	default:
+		if log != nil {
+			log("[c/c++] no recognised build system — will attempt make")
+		}
 	}
 
 	return nil
@@ -160,6 +146,7 @@ func (e *Environment) CppEnvVars() []string {
 }
 
 // installPrefix returns the local install prefix for compiled apps.
+// Always uses ~/.local on Unix so we never need root for install.
 // Linux/macOS: ~/.local  Windows: %USERPROFILE%\.cloneable
 func (e *Environment) installPrefix() string {
 	if runtime.GOOS == "windows" {
@@ -191,13 +178,17 @@ func (e *Environment) ZigEnvVars() []string {
 
 // ── Flutter / Dart ────────────────────────────────────────────────────────────
 
+// setupFlutter prepares a Flutter/Dart environment.
+// IMPORTANT: This only marks the env as ready. It does NOT run `flutter pub get` —
+// that is a dependency install step and belongs in installFlutter(), which runs
+// AFTER system deps are installed. Running pub get before Flutter SDK is installed
+// causes guaranteed failures.
 func (e *Environment) setupFlutter(log LogWriter) error {
 	e.EnvDir = ""
 	if log != nil {
-		log("[flutter] running flutter pub get to prepare dependencies")
+		log("[flutter] environment ready — dependencies will be fetched during install phase")
 	}
-	// flutter pub get fetches dependencies into the Flutter cache — not local
-	return runCmd(log, "flutter", "pub", "get")
+	return nil
 }
 
 // FlutterEnvVars returns environment variables for Flutter builds.
@@ -239,10 +230,12 @@ func (e *Environment) setupRuby(log LogWriter) error {
 		return err
 	}
 
-	// Configure bundler to use local vendor path
-	if err := runCmd(log, "bundle", "config", "set", "--local", "path", "vendor/bundle"); err != nil {
-		if log != nil {
-			log("[ruby] warning: could not configure bundler path — continuing anyway")
+	// Configure bundler to use local vendor path — best-effort
+	if binaryExists("bundle") {
+		if err := runCmd(log, "bundle", "config", "set", "--local", "path", "vendor/bundle"); err != nil {
+			if log != nil {
+				log("[ruby] warning: could not configure bundler path — continuing anyway")
+			}
 		}
 	}
 

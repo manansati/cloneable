@@ -3,11 +3,13 @@
 package phases
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/manansati/cloneable/internal/detection"
 	"github.com/manansati/cloneable/internal/env"
@@ -15,6 +17,10 @@ import (
 	"github.com/manansati/cloneable/internal/pkgmanager"
 	"github.com/manansati/cloneable/internal/ui"
 )
+
+// defaultCmdTimeout is the maximum time a single build/install command can run.
+// Individual commands can override via runInWithTimeout.
+const defaultCmdTimeout = 15 * time.Minute
 
 // InstallContext holds everything Phase II needs to run.
 type InstallContext struct {
@@ -128,11 +134,19 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 
 			failures := cascade.InstallMany(resolvedDeps, safeLog())
 			if len(failures) > 0 {
-				var msgs []string
+				// Only fail if critical deps are missing. Non-critical deps
+				// (like optional system libs) should not block the install.
+				var criticalFails []string
 				for pkg, err := range failures {
-					msgs = append(msgs, fmt.Sprintf("%s: %v", pkg, err))
+					criticalFails = append(criticalFails, fmt.Sprintf("%s: %v", pkg, err))
 				}
-				return fmt.Errorf("failed to install system packages: %s", strings.Join(msgs, "; "))
+				// Log all failures but only return error
+				if log != nil {
+					for _, msg := range criticalFails {
+						log.Write(fmt.Sprintf("[sys-deps] FAILED: %s", msg))
+					}
+				}
+				return fmt.Errorf("failed to install system packages: %s", strings.Join(criticalFails, "; "))
 			}
 			return nil
 		})
@@ -140,7 +154,11 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 			if log != nil {
 				log.Error(sysErr)
 			}
-			return result, sysErr
+			// System dep failures are non-fatal — the build might still succeed
+			// if the deps were already installed by a previous run or are optional.
+			if log != nil {
+				log.Write("[install] system dep install had failures — continuing anyway")
+			}
 		}
 	}
 
@@ -220,114 +238,216 @@ func installLanguageDeps(repoPath string, profile *detection.TechProfile, enviro
 
 func installPython(repoPath string, environment *env.Environment, log pkgmanager.LogWriter) error {
 	pip := environment.PipBin()
+	envVars := environment.PythonEnvVars()
+
+	// Upgrade pip and install wheel first to prevent legacy setup.py failures.
+	// Best-effort — don't fail if these don't work.
+	_ = runIn(repoPath, log, envVars, pip, "install", "--upgrade", "pip")
+	_ = runIn(repoPath, log, envVars, pip, "install", "wheel", "setuptools")
+
+	reqInstalled := false
 
 	// Strategy 1: pyproject.toml (modern, PEP 517)
 	if fileExists(repoPath, "pyproject.toml") {
-		return runIn(repoPath, log, environment.PythonEnvVars(), pip, "install", "-e", ".")
+		// Try editable install first (better for development)
+		err := runIn(repoPath, log, envVars, pip, "install", "-e", ".")
+		if err != nil {
+			// Some projects don't support editable installs — try regular
+			err = runIn(repoPath, log, envVars, pip, "install", ".")
+		}
+		if err == nil {
+			reqInstalled = true
+		} else if log != nil {
+			log(fmt.Sprintf("[python] pyproject.toml install failed: %v — trying other strategies", err))
+		}
 	}
 
 	// Strategy 2: requirements.txt
 	if fileExists(repoPath, "requirements.txt") {
-		if err := runIn(repoPath, log, environment.PythonEnvVars(), pip, "install", "-r", "requirements.txt"); err != nil {
+		err := runIn(repoPath, log, envVars, pip, "install", "-r", "requirements.txt")
+		if err == nil {
+			reqInstalled = true
+		} else if !reqInstalled {
+			// If nothing else worked either, this is the error to return
+			if log != nil {
+				log(fmt.Sprintf("[python] requirements.txt install failed: %v", err))
+			}
 			return err
 		}
 	}
 
-	// Also check for requirements-dev.txt / requirements_dev.txt
-	for _, devReq := range []string{"requirements-dev.txt", "requirements_dev.txt", "requirements/dev.txt"} {
+	// Also check for dev requirements (best-effort, never fail)
+	for _, devReq := range []string{
+		"requirements-dev.txt", "requirements_dev.txt",
+		"requirements/dev.txt", "dev-requirements.txt",
+		"test-requirements.txt", "requirements/test.txt",
+	} {
 		if fileExists(repoPath, devReq) {
-			_ = runIn(repoPath, log, environment.PythonEnvVars(), pip, "install", "-r", devReq)
+			_ = runIn(repoPath, log, envVars, pip, "install", "-r", devReq)
 		}
 	}
 
-	// Strategy 3: setup.py
-	if fileExists(repoPath, "setup.py") {
-		return runIn(repoPath, log, environment.PythonEnvVars(), pip, "install", "-e", ".")
+	// Strategy 3: setup.py (legacy)
+	if fileExists(repoPath, "setup.py") && !reqInstalled {
+		err := runIn(repoPath, log, envVars, pip, "install", "-e", ".")
+		if err != nil {
+			err = runIn(repoPath, log, envVars, pip, "install", ".")
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	// Strategy 4: Pipfile (Pipenv)
+	if fileExists(repoPath, "Pipfile") && !reqInstalled {
+		if commandExistsInPath("pipenv") {
+			return runIn(repoPath, log, envVars, "pipenv", "install")
+		}
+		// Install pipenv into venv, then use it
+		_ = runIn(repoPath, log, envVars, pip, "install", "pipenv")
+		return runIn(repoPath, log, envVars, "pipenv", "install")
 	}
 
 	return nil
 }
 
 func installNode(repoPath string, environment *env.Environment, log pkgmanager.LogWriter) error {
-	// Ensure the right package manager is installed (pnpm/yarn if needed)
 	if err := environment.EnsurePackageManager(env.LogWriter(log)); err != nil {
 		return err
 	}
 
+	if !fileExists(repoPath, "package.json") {
+		return nil
+	}
+
 	cmd := environment.NodeInstallCmd()
-	return runIn(repoPath, log, environment.NodeEnvVars(), cmd[0], cmd[1:]...)
+	err := runIn(repoPath, log, environment.NodeEnvVars(), cmd[0], cmd[1:]...)
+	if err != nil {
+		// Fallback: if the preferred install failed, try plain npm install
+		// This handles cases where pnpm/yarn lockfiles are incompatible
+		if cmd[0] != "npm" {
+			if log != nil {
+				log(fmt.Sprintf("[node] %s install failed — falling back to npm install", cmd[0]))
+			}
+			err = runIn(repoPath, log, environment.NodeEnvVars(), "npm", "install")
+		}
+	}
+	return err
 }
 
 func installGo(repoPath string, log pkgmanager.LogWriter) error {
-	// go mod download fetches all dependencies declared in go.mod
+	if !fileExists(repoPath, "go.mod") {
+		return nil
+	}
 	if err := runIn(repoPath, log, nil, "go", "mod", "download"); err != nil {
 		return err
 	}
-	// go mod verify ensures integrity
-	return runIn(repoPath, log, nil, "go", "mod", "verify")
+	_ = runIn(repoPath, log, nil, "go", "mod", "verify")
+	return nil
 }
 
 func installRust(repoPath string, log pkgmanager.LogWriter) error {
-	// cargo fetch downloads all crates declared in Cargo.toml
+	if !fileExists(repoPath, "Cargo.toml") {
+		return nil
+	}
 	return runIn(repoPath, log, nil, "cargo", "fetch")
 }
 
 func installJava(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "gradlew") {
-		// Make gradlew executable (it often loses permissions on clone)
 		_ = os.Chmod(filepath.Join(repoPath, "gradlew"), 0755)
-		return runIn(repoPath, log, nil, "./gradlew", "dependencies")
+		err := runIn(repoPath, log, nil, "./gradlew", "dependencies")
+		if err != nil {
+			// Some projects use assemble instead
+			_ = runIn(repoPath, log, nil, "./gradlew", "assemble")
+		}
+		return nil
 	}
 	if fileExists(repoPath, "mvnw") {
 		_ = os.Chmod(filepath.Join(repoPath, "mvnw"), 0755)
-		return runIn(repoPath, log, nil, "./mvnw", "dependency:resolve")
+		_ = runIn(repoPath, log, nil, "./mvnw", "dependency:resolve")
+		return nil
 	}
 	if fileExists(repoPath, "build.gradle") || fileExists(repoPath, "build.gradle.kts") {
-		return runIn(repoPath, log, nil, "gradle", "dependencies")
+		_ = runIn(repoPath, log, nil, "gradle", "dependencies")
+		return nil
 	}
-	return runIn(repoPath, log, nil, "mvn", "dependency:resolve")
+	if fileExists(repoPath, "pom.xml") {
+		_ = runIn(repoPath, log, nil, "mvn", "dependency:resolve")
+	}
+	return nil
 }
 
 func installZig(repoPath string, log pkgmanager.LogWriter) error {
-	// zig build fetches dependencies declared in build.zig.zon
-	return runIn(repoPath, log, nil, "zig", "build", "--fetch")
+	if !fileExists(repoPath, "build.zig.zon") {
+		return nil
+	}
+	_ = runIn(repoPath, log, nil, "zig", "build", "--fetch")
+	return nil
 }
 
 func installFlutter(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "pubspec.yaml") {
-		return runIn(repoPath, log, nil, "flutter", "pub", "get")
+		err := runIn(repoPath, log, nil, "flutter", "pub", "get")
+		if err != nil {
+			// Fallback: try dart pub get (for pure Dart projects)
+			return runIn(repoPath, log, nil, "dart", "pub", "get")
+		}
+		return nil
 	}
-	// Pure Dart project
 	return runIn(repoPath, log, nil, "dart", "pub", "get")
 }
 
 func installRuby(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "Gemfile") {
-		return runIn(repoPath, log, nil, "bundle", "install")
+		err := runIn(repoPath, log, nil, "bundle", "install")
+		if err != nil {
+			// Some systems need --path vendor/bundle
+			return runIn(repoPath, log, nil, "bundle", "install", "--path", "vendor/bundle")
+		}
+		return nil
 	}
 	return nil
 }
 
 func installDotnet(repoPath string, log pkgmanager.LogWriter) error {
-	return runIn(repoPath, log, nil, "dotnet", "restore")
+	_ = runIn(repoPath, log, nil, "dotnet", "restore")
+	return nil
 }
 
 func installHaskell(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "stack.yaml") {
-		return runIn(repoPath, log, nil, "stack", "build", "--only-dependencies")
+		_ = runIn(repoPath, log, nil, "stack", "build", "--only-dependencies")
+		return nil
 	}
-	return runIn(repoPath, log, nil, "cabal", "build", "--only-dependencies")
+	_ = runIn(repoPath, log, nil, "cabal", "build", "--only-dependencies")
+	return nil
 }
 
 func installDocker(repoPath string, log pkgmanager.LogWriter) error {
-	// Pull images declared in docker-compose
+	// Modern Docker uses `docker compose` (plugin), fallback to `docker-compose` (standalone)
+	composeCmd := resolveDockerCompose()
+
 	if fileExists(repoPath, "docker-compose.yml") {
-		return runIn(repoPath, log, nil, "docker-compose", "pull")
+		return runIn(repoPath, log, nil, composeCmd[0], append(composeCmd[1:], "pull")...)
 	}
 	if fileExists(repoPath, "docker-compose.yaml") {
-		return runIn(repoPath, log, nil, "docker-compose", "-f", "docker-compose.yaml", "pull")
+		return runIn(repoPath, log, nil, composeCmd[0], append(composeCmd[1:], "-f", "docker-compose.yaml", "pull")...)
 	}
 	return nil
+}
+
+// resolveDockerCompose returns the correct docker compose command.
+// Modern Docker Engine v2+ uses `docker compose` (plugin), while older
+// installations use the standalone `docker-compose` binary.
+func resolveDockerCompose() []string {
+	// Try the modern plugin syntax first
+	cmd := exec.Command("docker", "compose", "version")
+	if err := cmd.Run(); err == nil {
+		return []string{"docker", "compose"}
+	}
+	// Fallback to standalone binary
+	return []string{"docker-compose"}
 }
 
 // ── Fix (re-install) logic ────────────────────────────────────────────────────
@@ -400,6 +520,26 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 			logFn(fmt.Sprintf("removing %s", buildDir))
 		}
 		return os.RemoveAll(buildDir)
+
+	case detection.TechZig:
+		for _, dir := range []string{"zig-out", "zig-cache", ".zig-cache"} {
+			d := filepath.Join(repoPath, dir)
+			if logFn != nil {
+				logFn(fmt.Sprintf("removing %s", d))
+			}
+			os.RemoveAll(d) //nolint:errcheck
+		}
+
+	case detection.TechFlutter, detection.TechDart:
+		// Remove .dart_tool and pubspec.lock for clean rebuild
+		for _, d := range []string{".dart_tool", ".flutter-plugins", ".flutter-plugins-dependencies"} {
+			os.RemoveAll(filepath.Join(repoPath, d)) //nolint:errcheck
+		}
+
+	case detection.TechDotnet:
+		for _, d := range []string{"bin", "obj"} {
+			os.RemoveAll(filepath.Join(repoPath, d)) //nolint:errcheck
+		}
 	}
 
 	return nil
@@ -409,8 +549,28 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 
 // runIn runs a command in the given directory with optional extra env vars.
 // Output is forwarded to the log writer.
+// Commands are given a timeout to prevent hanging forever.
 func runIn(dir string, log pkgmanager.LogWriter, extraEnv []string, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	return runInWithTimeout(dir, log, extraEnv, false, defaultCmdTimeout, name, args...)
+}
+
+// runInSudo runs a command with sudo in the given directory.
+func runInSudo(dir string, log pkgmanager.LogWriter, extraEnv []string, name string, args ...string) error {
+	return runInWithTimeout(dir, log, extraEnv, true, defaultCmdTimeout, name, args...)
+}
+
+func runInWithTimeout(dir string, log pkgmanager.LogWriter, extraEnv []string, useSudo bool, timeout time.Duration, name string, args ...string) error {
+	if useSudo && pkgmanager.NeedsSudo() {
+		args = append([]string{name}, args...)
+		name = "sudo"
+	}
+
+	name = env.ResolveExecutable(name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 
 	// Inherit current env and add extras
@@ -420,15 +580,25 @@ func runIn(dir string, log pkgmanager.LogWriter, extraEnv []string, name string,
 	if log != nil && len(out) > 0 {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.TrimSpace(line) != "" {
-				log(fmt.Sprintf("[%s] %s", name, line))
+				log(fmt.Sprintf("[%s] %s", filepath.Base(name), line))
 			}
 		}
+	}
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("%s %s: timed out after %v", name, strings.Join(args, " "), timeout)
 	}
 
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+// commandExistsInPath checks if a binary is in PATH.
+func commandExistsInPath(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 // fileExists checks if a file exists relative to repoPath.

@@ -223,33 +223,69 @@ func isDotfileRepo(repoPath string) bool {
 }
 
 // isDocsRepo checks whether a repo is documentation-only.
-func isDocsRepo(repoPath string) bool {
+// This is intentionally strict — we only trigger on explicit doc site
+// manifests (mkdocs.yml, book.toml, _config.yml) OR on repos that have
+// no code manifests and are primarily markdown files. The latter catches
+// repos like build-your-own-x that are pure README collections.
+func isDocsRepo(repoPath string, hasBuildable bool) bool {
 	entries, err := os.ReadDir(repoPath)
 	if err != nil {
 		return false
 	}
 
-	// Explicit doc site manifests
+	// Only explicit doc site manifests trigger docs mode
+	explicitDocManifests := map[string]bool{
+		"book.toml":   true, // mdBook
+		"mkdocs.yml":  true, // MkDocs
+		"mkdocs.yaml": true,
+		"_config.yml": true, // Jekyll (only if no other manifests)
+		"docusaurus.config.js": true,
+		"docusaurus.config.ts": true,
+	}
+
 	for _, entry := range entries {
-		for _, indicator := range docfileIndicators[1:] { // skip README.md — too common
-			if entry.Name() == indicator {
-				return true
-			}
+		if explicitDocManifests[entry.Name()] {
+			return true
 		}
 	}
 
-	// Count .md files vs total files — if >80% are markdown, it's a doc repo
-	total, md := 0, 0
+	// If the repo has a primary buildable technology, do not fall back to heuristics.
+	if hasBuildable {
+		return false
+	}
+
+	// Fallback: if the repo has a README.md and the majority of files are
+	// markdown, treat it as a documentation repo. This catches repos like
+	// build-your-own-x, awesome-* lists, etc.
+	hasReadme := false
+	mdCount := 0
+	totalFiles := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		total++
-		if strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
-			md++
+		name := strings.ToLower(entry.Name())
+		// Ignore cloneable's own log file so it doesn't break the heuristic
+		if name == "install.logs" {
+			continue
+		}
+		totalFiles++
+		if name == "readme.md" || name == "readme.markdown" {
+			hasReadme = true
+		}
+		if strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".markdown") ||
+			strings.HasSuffix(name, ".rst") || strings.HasSuffix(name, ".txt") {
+			mdCount++
 		}
 	}
-	if total > 0 && md*100/total >= 80 {
+
+	// A repo with a README and where >=50% of root files are docs
+	if hasReadme && totalFiles > 0 && mdCount*2 >= totalFiles {
+		return true
+	}
+
+	// A repo with just a README and maybe a LICENSE — still docs
+	if hasReadme && totalFiles <= 3 {
 		return true
 	}
 

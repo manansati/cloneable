@@ -6,24 +6,16 @@ import (
 	"path/filepath"
 
 	"github.com/manansati/cloneable/internal/git"
+	"github.com/manansati/cloneable/internal/logger"
 	"github.com/manansati/cloneable/internal/ui"
 	"github.com/spf13/cobra"
 )
 
-// cloneCmd handles: cloneable clone <git-url>
-// Clones the repository into the current working directory.
-// Phase I only — no dependency installation, no launch.
 var cloneCmd = &cobra.Command{
-	Use:   "clone <git-url>",
-	Short: "Clone a repository without installing or launching",
-	Long: `Clone a GitHub (or any git) repository into the current directory.
-This performs Phase I only — no dependency installation, no launch.
-
-Example:
-  cloneable clone https://github.com/neovim/neovim
-`,
+	Use:          "clone <git-url>",
+	Short:        "Clone a repository without installing or launching",
 	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
+	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		_, err := runClone(args[0], git.DuplicateAsk)
@@ -31,23 +23,16 @@ Example:
 	},
 }
 
-// runClone is the shared clone implementation used by both cloneCmd
-// and runFullFlow. It shows the header, handles duplicates, and runs
-// the clone with an animated spinner.
-//
-// onDuplicate controls what happens if the target folder already exists.
-// Returns the CloneResult so the full flow can proceed to Phase II/III.
+// runClone is the shared clone implementation.
+// Does NOT use a bubbletea spinner — the git progress bar renders directly to stdout.
 func runClone(rawURL string, onDuplicate git.DuplicateAction) (*git.CloneResult, error) {
-	// Get current working directory — clone goes here
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("could not determine current directory: %w", err)
 	}
 
-	// Extract repo name early so we can show it in the header
 	repoName := git.ExtractRepoName(rawURL)
 
-	// Print the header now that we know the repo name
 	ui.PrintHeader(ui.HeaderInfo{
 		OS:         sysInfo.DisplayName(),
 		Distro:     string(sysInfo.Distro),
@@ -55,7 +40,6 @@ func runClone(rawURL string, onDuplicate git.DuplicateAction) (*git.CloneResult,
 		RepoName:   repoName,
 	})
 
-	// Check for an existing directory and ask user what to do
 	if onDuplicate == git.DuplicateAsk {
 		resolved, err := resolveDuplicate(cwd, repoName)
 		if err != nil {
@@ -64,27 +48,30 @@ func runClone(rawURL string, onDuplicate git.DuplicateAction) (*git.CloneResult,
 		onDuplicate = resolved
 	}
 
-	// Run the clone with a spinner
-	var result *git.CloneResult
-	cloneErr := ui.RunWithSpinner("Cloning", func() error {
-		r, err := git.Clone(git.CloneOptions{
-			URL:         rawURL,
-			DestDir:     cwd,
-			OnDuplicate: onDuplicate,
-			Auth:        gitAuthFromEnv(),
-		})
-		if err != nil {
-			return err
-		}
-		result = r
-		return nil
-	})
-
-	if cloneErr != nil {
-		return nil, cloneErr
+	// Open a log writer for git output (goes to install.logs if repo exists,
+	// otherwise discarded — we haven't cloned yet so there's no repo dir)
+	var logFn func(string)
+	tmpLogPath := filepath.Join(os.TempDir(), "cloneable-clone.log")
+	if lf, err := logger.NewRaw(tmpLogPath); err == nil {
+		logFn = lf.Write
+		defer lf.Close()
 	}
 
-	// Report outcome
+	// Print the label — progress bar will render on the same line block below
+	fmt.Printf("\n  Cloning %s\n\n", ui.SaffronBold(repoName))
+
+	result, err := git.Clone(git.CloneOptions{
+		URL:         rawURL,
+		DestDir:     cwd,
+		OnDuplicate: onDuplicate,
+		Auth:        gitAuthFromEnv(),
+		ProgressFn:  logFn,
+	})
+	if err != nil {
+		fmt.Println() // ensure we're on a new line after any partial progress
+		return nil, err
+	}
+
 	if result.AlreadyExisted {
 		fmt.Printf("\n  %s  Using existing directory: %s\n",
 			ui.Tick(), ui.SaffronBold(result.ClonedPath))
@@ -99,17 +86,13 @@ func runClone(rawURL string, onDuplicate git.DuplicateAction) (*git.CloneResult,
 	return result, nil
 }
 
-// resolveDuplicate checks if a directory already exists and asks the user
-// what to do. Returns the resolved DuplicateAction.
 func resolveDuplicate(destDir, repoName string) (git.DuplicateAction, error) {
 	targetPath := filepath.Join(destDir, repoName)
 
 	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-		// Directory doesn't exist — nothing to resolve
 		return git.DuplicateReplace, nil
 	}
 
-	// Directory exists — show the selector
 	opts := []ui.SelectorOption{
 		{
 			Label:       "Replace it",
@@ -140,15 +123,44 @@ func resolveDuplicate(destDir, repoName string) (git.DuplicateAction, error) {
 	return git.DuplicateSkip, nil
 }
 
-// gitAuthFromEnv reads GitHub credentials from environment variables.
-// GITHUB_TOKEN is the standard variable used by GitHub CLI and Actions.
 func gitAuthFromEnv() *git.Auth {
+	// Check env var first, then saved config
 	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		// Read from github config
+		home, _ := os.UserHomeDir()
+		if home != "" {
+			// Simple read without importing github package (avoids import cycles)
+			data, err := os.ReadFile(filepath.Join(home, ".cloneable", "config.json"))
+			if err == nil {
+				// Quick extract of token field
+				s := string(data)
+				if idx := indexStr(s, `"github_token"`); idx >= 0 {
+					rest := s[idx+len(`"github_token"`):]
+					if idx2 := indexStr(rest, `"`); idx2 >= 0 {
+						rest = rest[idx2+1:]
+						if idx3 := indexStr(rest, `"`); idx3 >= 0 {
+							token = rest[:idx3]
+						}
+					}
+				}
+			}
+		}
+	}
 	if token == "" {
 		return nil
 	}
 	return &git.Auth{
-		Username: "token", // GitHub accepts any non-empty username with a token
+		Username: "token",
 		Token:    token,
 	}
+}
+
+func indexStr(s, sub string) int {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }

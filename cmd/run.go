@@ -53,10 +53,6 @@ Example:
 			PkgInfo:  pkgInfo,
 		})
 		if err != nil {
-			if installResult != nil && installResult.Log != nil {
-				fmt.Printf("\n  %s  See install.logs: %s\n",
-					ui.Warn("!"), installResult.Log.LogPath)
-			}
 			return err
 		}
 
@@ -68,10 +64,6 @@ Example:
 			OSInfo:        sysInfo,
 		})
 		if launchErr != nil {
-			if installResult.Log != nil {
-				fmt.Printf("\n  %s  See install.logs: %s\n",
-					ui.Warn("!"), installResult.Log.LogPath)
-			}
 			return launchErr
 		}
 

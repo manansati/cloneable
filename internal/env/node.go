@@ -34,15 +34,17 @@ func (e *Environment) NodePackageManager() string {
 }
 
 // NodeInstallCmd returns the correct install command for this project.
+// Does NOT use --frozen-lockfile because fresh clones often have stale
+// or missing lockfiles that cause install to fail outright.
 func (e *Environment) NodeInstallCmd() []string {
 	pm := e.NodePackageManager()
 	switch pm {
 	case "pnpm":
-		return []string{"pnpm", "install", "--frozen-lockfile"}
+		return []string{"pnpm", "install", "--no-frozen-lockfile"}
 	case "yarn":
-		return []string{"yarn", "install", "--frozen-lockfile"}
+		return []string{"yarn", "install"}
 	default:
-		return []string{"npm", "install", "--prefer-offline"}
+		return []string{"npm", "install"}
 	}
 }
 

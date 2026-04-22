@@ -3,6 +3,7 @@ package detection
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -48,7 +49,8 @@ func DetermineCategory(repoPath string, primary TechType, manifests []FoundManif
 	}
 
 	// Check for docs repo
-	if isDocsRepo(repoPath) {
+	hasBuildable := primary != TechUnknown && primary != TechDocs
+	if isDocsRepo(repoPath, hasBuildable) {
 		return CategoryDocs
 	}
 
@@ -192,11 +194,22 @@ func pythonIsCLI(repoPath string) bool {
 
 // ── Build & Run command determination ────────────────────────────────────────
 
+// localPrefix returns ~/.local for the install prefix on Unix,
+// or %USERPROFILE%\.cloneable on Windows. Used to avoid needing sudo.
+func localPrefix() string {
+	home, _ := os.UserHomeDir()
+	if runtime.GOOS == "windows" {
+		return filepath.Join(home, ".cloneable")
+	}
+	return filepath.Join(home, ".local")
+}
+
 // BuildCommand returns the best build command for the given tech in the repo.
 func BuildCommand(repoPath string, tech TechType) []string {
 	switch tech {
 	case TechGo:
-		return []string{"go", "build", "./..."}
+		// Build all packages; `go install ./...` will place binaries in GOPATH/bin
+		return []string{"go", "build", "-v", "./..."}
 	case TechRust:
 		return []string{"cargo", "build", "--release"}
 	case TechNode:
@@ -221,13 +234,21 @@ func BuildCommand(repoPath string, tech TechType) []string {
 		}
 		return []string{"mvn", "package"}
 	case TechCpp:
+		// The actual build logic is in launch.go's buildCpp which handles the
+		// full configure+build two-step. This just provides the "build" command
+		// for the profile. buildCpp() ignores this and does its own thing.
 		if fileExists(repoPath, "CMakeLists.txt") {
-			return []string{"cmake", "--build", "."}
+			return []string{"cmake", "--build", "build", "--parallel"}
 		}
 		if fileExists(repoPath, "meson.build") {
 			return []string{"meson", "compile", "-C", "build"}
 		}
-		return []string{"make"}
+		return []string{"make", "-j4"}
+	case TechC:
+		if fileExists(repoPath, "CMakeLists.txt") {
+			return []string{"cmake", "--build", "build", "--parallel"}
+		}
+		return []string{"make", "-j4"}
 	case TechZig:
 		return []string{"zig", "build"}
 	case TechFlutter:
@@ -274,10 +295,12 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 		}
 		return []string{"mvn", "exec:java"}
 	case TechCpp, TechC:
-		// After build, look for the compiled binary
-		return []string{"make", "run"}
+		// After build, the binary name matches the repo name.
+		// launch.go's FindBinary handles locating it — RunCommand is unused for native compiled.
+		return nil
 	case TechZig:
-		return []string{"zig", "build", "run"}
+		// Same — binary is found by name after install. No "zig build run" ever.
+		return nil
 	case TechFlutter:
 		return []string{"flutter", "run"}
 	case TechDart:
@@ -295,8 +318,9 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 		}
 		return []string{"cabal", "run"}
 	case TechDocker:
+		// Modern Docker uses `docker compose` (plugin), fallback to `docker-compose` (standalone)
 		if fileExists(repoPath, "docker-compose.yml") || fileExists(repoPath, "docker-compose.yaml") {
-			return []string{"docker-compose", "up"}
+			return []string{"docker", "compose", "up"}
 		}
 		return []string{"docker", "build", "-t", "app", ".", "&&", "docker", "run", "app"}
 	}
@@ -304,7 +328,10 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 }
 
 // InstallGlobalCommand returns the command that installs the binary globally.
+// Where possible, installs to ~/.local (no root needed) instead of /usr/local.
 func InstallGlobalCommand(repoPath string, tech TechType) []string {
+	prefix := localPrefix()
+
 	switch tech {
 	case TechGo:
 		return []string{"go", "install", "./..."}
@@ -313,21 +340,31 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 	case TechNode:
 		return []string{"npm", "install", "-g", "."}
 	case TechPython:
+		// Install from the venv's pip (the venv env vars will be set by the caller).
 		return []string{"pip", "install", "."}
 	case TechCpp, TechC:
 		if fileExists(repoPath, "CMakeLists.txt") {
-			return []string{"cmake", "--install", "build"}
+			return []string{"cmake", "--install", "build", "--prefix", prefix}
 		}
-		return []string{"make", "install"}
+		if fileExists(repoPath, "meson.build") {
+			return []string{"meson", "install", "-C", "build"}
+		}
+		// Plain makefile — PREFIX tells make where to install
+		return []string{"make", "install", "PREFIX=" + prefix}
 	case TechZig:
-		return []string{"zig", "build", "install"}
+		// zig build install -p ~/.local → binary lands in ~/.local/bin
+		return []string{"zig", "build", "install", "-p", prefix}
 	case TechHaskell:
 		if fileExists(repoPath, "stack.yaml") {
 			return []string{"stack", "install"}
 		}
-		return []string{"cabal", "install"}
+		return []string{"cabal", "install", "--overwrite-policy=always"}
 	case TechDotnet:
 		return []string{"dotnet", "tool", "install", "--global", "."}
+	case TechScripts:
+		if fileExists(repoPath, "Makefile") || fileExists(repoPath, "GNUmakefile") {
+			return []string{"make", "install", "PREFIX=" + prefix}
+		}
 	}
 	return nil
 }

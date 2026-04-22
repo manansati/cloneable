@@ -326,6 +326,42 @@ var PackageNames = map[string]map[string]string{
 		"choco":  "ninja",
 		"scoop":  "ninja",
 	},
+	"libadwaita": {
+		"apt":    "libadwaita-1-dev",
+		"dnf":    "libadwaita-devel",
+		"pacman": "libadwaita",
+		"brew":   "libadwaita",
+	},
+	"wayland-protocols": {
+		"apt":    "wayland-protocols",
+		"dnf":    "wayland-protocols-devel",
+		"pacman": "wayland-protocols",
+		"brew":   "wayland-protocols",
+	},
+	"libxkbcommon": {
+		"apt":    "libxkbcommon-dev",
+		"dnf":    "libxkbcommon-devel",
+		"pacman": "libxkbcommon",
+		"brew":   "libxkbcommon",
+	},
+	"pandoc": {
+		"apt":    "pandoc",
+		"dnf":    "pandoc",
+		"pacman": "pandoc",
+		"brew":   "pandoc",
+	},
+	"glib-compile-resources": {
+		"apt":    "libglib2.0-dev",
+		"dnf":    "glib2-devel",
+		"pacman": "glib2",
+		"brew":   "glib",
+	},
+	"blueprint-compiler": {
+		"apt":    "blueprint-compiler",
+		"dnf":    "blueprint-compiler",
+		"pacman": "blueprint-compiler",
+		"brew":   "blueprint-compiler",
+	},
 }
 
 // ResolvePackageName returns the correct package name for the current

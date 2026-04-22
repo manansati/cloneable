@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"runtime"
 
 	"github.com/manansati/cloneable/internal/detection"
 	"github.com/manansati/cloneable/internal/git"
@@ -27,8 +26,8 @@ var pkgInfo *detection.PkgManagerInfo
 
 var rootCmd = &cobra.Command{
 	Use:           "cloneable [git-url]",
-	Short:         "Clone, install, and launch any GitHub repo — automatically",
-	Long:          `Clone any GitHub repository, install its dependencies, and launch it.`,
+	Short:         "",
+	Long:          "",
 	Args:          cobra.MaximumNArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -59,7 +58,7 @@ var rootCmd = &cobra.Command{
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "\n  error: %s\n\n", err)
+		fmt.Fprintf(os.Stderr, "\n  %s  %s\n\n", ui.Warn("error:"), err)
 		os.Exit(1)
 	}
 }
@@ -71,6 +70,7 @@ func init() {
 	rootCmd.AddCommand(infoCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(exploreCmd)
 	rootCmd.AddCommand(updateCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(removeCmd)
@@ -85,10 +85,11 @@ func init() {
 
 	rootCmd.SetUsageTemplate(`Usage:
   cloneable <git-url>    Clone, install, and launch a repository
-  cloneable              Run inside an already-cloned repository
+  cloneable              Explore trending repositories (or run inside cloned repo)
 
 Commands:
   clone <url>    Clone only
+  explore        Trending repositories
   search <query> Search GitHub interactively
   info [url]     Language breakdown
   list           List installed repos
@@ -140,7 +141,7 @@ func rootRunE(cmd *cobra.Command, args []string) error {
 		return runInsideRepo()
 	}
 
-	return cmd.Help()
+	return exploreCmd.RunE(exploreCmd, args)
 }
 
 func runFullFlow(rawURL string) error {
@@ -156,10 +157,6 @@ func runFullFlow(rawURL string) error {
 		PkgInfo:  pkgInfo,
 	})
 	if err != nil {
-		if installResult != nil && installResult.Log != nil {
-			fmt.Printf("\n  %s  See install.logs: %s\n",
-				ui.Warn("!"), installResult.Log.LogPath)
-		}
 		return err
 	}
 
@@ -171,8 +168,7 @@ func runFullFlow(rawURL string) error {
 	})
 	if launchErr != nil {
 		if installResult.Log != nil {
-			fmt.Printf("\n  %s  See install.logs: %s\n",
-				ui.Warn("!"), installResult.Log.LogPath)
+			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", launchErr, ui.Warn("!"), installResult.Log.LogPath)
 		}
 		return launchErr
 	}
@@ -209,8 +205,7 @@ func runInsideRepo() error {
 	})
 	if err != nil {
 		if installResult != nil && installResult.Log != nil {
-			fmt.Printf("\n  %s  See install.logs: %s\n",
-				ui.Warn("!"), installResult.Log.LogPath)
+			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", err, ui.Warn("!"), installResult.Log.LogPath)
 		}
 		return err
 	}
@@ -222,9 +217,8 @@ func runInsideRepo() error {
 		OSInfo:        sysInfo,
 	})
 	if launchErr != nil {
-		if installResult.Log != nil {
-			fmt.Printf("\n  %s  See install.logs: %s\n",
-				ui.Warn("!"), installResult.Log.LogPath)
+		if installResult != nil && installResult.Log != nil {
+			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", launchErr, ui.Warn("!"), installResult.Log.LogPath)
 		}
 		return launchErr
 	}
@@ -238,24 +232,7 @@ func isInsideGitRepo() bool {
 }
 
 func printVersion() {
-	fmt.Printf("\n")
-	fmt.Printf("  Cloneable  v%s\n", Version)
-	fmt.Printf("  Platform   %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("  Go         %s\n", runtime.Version())
-	if BuildDate != "unknown" {
-		fmt.Printf("  Built      %s\n", BuildDate)
-	}
-	if sysInfo != nil {
-		fmt.Printf("  OS         %s\n", sysInfo.DisplayName())
-	}
-	if pkgInfo != nil {
-		fmt.Printf("  Packages   %s\n", pkgInfo.DisplayName())
-	}
-	if sysInfo != nil {
-		fmt.Printf("  Bin dir    %s\n", sysInfo.BinDir)
-	}
-	fmt.Printf("  Repo       https://github.com/manansati/cloneable\n")
-	fmt.Printf("\n")
+	fmt.Printf("cloneable %s\n", Version)
 }
 
 func saveReceipt(

@@ -149,51 +149,19 @@ func (e *Environment) EnsureBinDirInPath() {
 		return
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-
-	exportLine := fmt.Sprintf("\n# Cloneable\nexport PATH=\"%s:$PATH\"\n", e.BinDir)
-	fishLine := fmt.Sprintf("\n# Cloneable\nfish_add_path %s\n", e.BinDir)
-
-	type cfg struct {
-		path string
-		line string
-	}
-
-	configs := []cfg{
-		{filepath.Join(home, ".bashrc"), exportLine},
-		{filepath.Join(home, ".bash_profile"), exportLine},
-		{filepath.Join(home, ".zshrc"), exportLine},
-		{filepath.Join(home, ".profile"), exportLine},
-		{filepath.Join(home, ".config", "fish", "config.fish"), fishLine},
-	}
-
-	added := false
-	for _, c := range configs {
-		if !fileExists(c.path) {
-			continue
-		}
-		if fileContains(c.path, e.BinDir) {
-			continue
-		}
-		if err := appendToFile(c.path, c.line); err == nil {
-			added = true
-		}
-	}
-
-	if !added {
-		// Print manual instruction using the active shell syntax
-		switch detectShell() {
-		case "fish":
-			fmt.Printf("\n  Add to PATH:  fish_add_path %s\n\n", e.BinDir)
-		default:
-			fmt.Printf("\n  Add to PATH:  export PATH=\"%s:$PATH\"\n\n", e.BinDir)
-		}
+	if runtime.GOOS == "windows" {
+		_ = AddToPATHWindows(e.BinDir, nil)
 	} else {
-		fmt.Printf("\n  %s  Added %s to your shell configs.\n", ui.Tick(), ui.Muted(e.BinDir))
-		fmt.Printf("  %s  %s\n\n", ui.Warn("!"), ui.SaffronBold("Restart your terminal to apply."))
+		_ = AddToPATHUnix(e.BinDir, nil)
+	}
+
+	// Update current process PATH so we can launch it right away
+	newPath := fmt.Sprintf("%s%c%s", e.BinDir, os.PathListSeparator, pathEnv)
+	os.Setenv("PATH", newPath)
+
+	fmt.Printf("\n  %s  Added %s to your PATH.\n", ui.Tick(), ui.Muted(e.BinDir))
+	if runtime.GOOS != "windows" {
+		fmt.Printf("  %s  %s\n\n", ui.Warn("!"), ui.SaffronBold("Restart your terminal to apply to future sessions."))
 	}
 }
 
