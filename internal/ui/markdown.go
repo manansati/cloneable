@@ -232,6 +232,39 @@ func renderMarkdownString(content string) string {
 			}
 		}
 
+		// ── HTML comments — skip entirely ────────────────────────────
+		if strings.HasPrefix(trimmed, "<!--") {
+			// Skip multi-line comments
+			if !strings.Contains(trimmed, "-->") {
+				for i++; i < len(lines); i++ {
+					if strings.Contains(lines[i], "-->") {
+						break
+					}
+				}
+			}
+			continue
+		}
+
+		// ── HTML tags — strip and render inner text ──────────────────
+		if strings.HasPrefix(trimmed, "<") && strings.Contains(trimmed, ">") {
+			// Strip all HTML tags, render any remaining text
+			stripped := stripHTMLTags(trimmed)
+			if strings.TrimSpace(stripped) != "" {
+				out = append(out, "  "+renderInline(strings.TrimSpace(stripped)))
+			}
+			continue
+		}
+
+		// ── Images ![alt](url) — show alt text ──────────────────────
+		if strings.HasPrefix(trimmed, "![") {
+			closeBracket := strings.Index(trimmed, "](")
+			if closeBracket > 0 {
+				altText := trimmed[2:closeBracket]
+				out = append(out, "  "+mdItalic.Render("[image: "+altText+"]"))
+				continue
+			}
+		}
+
 		// ── Empty lines ──────────────────────────────────────────────
 		if trimmed == "" {
 			out = append(out, "")
@@ -408,4 +441,25 @@ func pipeToLess(content string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// stripHTMLTags removes all HTML tags from a string, preserving inner text.
+// e.g. "<p>hello <b>world</b></p>" → "hello world"
+func stripHTMLTags(s string) string {
+	var result strings.Builder
+	inTag := false
+	for _, ch := range s {
+		if ch == '<' {
+			inTag = true
+			continue
+		}
+		if ch == '>' {
+			inTag = false
+			continue
+		}
+		if !inTag {
+			result.WriteRune(ch)
+		}
+	}
+	return result.String()
 }

@@ -86,6 +86,8 @@ var manifestTable = []ManifestEntry{
 	{File: ".stow-local-ignore", Tech: TechDotfile, Confidence: 90, IsPrimary: true},
 	{File: ".chezmoi.yaml", Tech: TechDotfile, Confidence: 95, IsPrimary: true},
 	{File: ".chezmoi.toml", Tech: TechDotfile, Confidence: 95, IsPrimary: true},
+	{File: ".chezmoiroot", Tech: TechDotfile, Confidence: 95, IsPrimary: true},
+	{File: ".yadm", Tech: TechDotfile, Confidence: 90, IsPrimary: true},
 }
 
 // dotfileIndicators are directory names commonly found in dotfile repos.
@@ -94,6 +96,8 @@ var dotfileIndicators = []string{
 	".config", "nvim", "zsh", "bash", "fish", "tmux",
 	"hypr", "waybar", "kitty", "alacritty", "i3", "sway",
 	"rofi", "dunst", "polybar", "eww",
+	"wezterm", "foot", "starship", "picom", "bspwm", "awesome",
+	"vim", ".vim", "emacs", ".emacs.d",
 }
 
 // docfileIndicators are filenames that suggest a documentation-only repo.

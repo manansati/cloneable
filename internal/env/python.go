@@ -108,15 +108,49 @@ func (e *Environment) setupPython(log LogWriter) error {
 }
 
 // createActivateScript writes a helper script to easily activate the environment.
+// On Linux/macOS it creates both a .sh and optionally a Fish-compatible script.
+// On Windows it creates a .bat file.
 func (e *Environment) createActivateScript(venvPath string) {
+	venvBase := filepath.Base(venvPath)
 	if runtime.GOOS == "windows" {
 		scriptPath := filepath.Join(e.RepoPath, "cloneable-activate.bat")
-		content := fmt.Sprintf("@echo off\r\ncall %%~dp0%s\\Scripts\\activate.bat\r\n", filepath.Base(venvPath))
+		content := "@echo off\r\n" +
+			"REM Cloneable — activate the Python virtual environment\r\n" +
+			"call \"%~dp0" + venvBase + "\\Scripts\\activate.bat\"\r\n" +
+			"echo Virtual environment activated.\r\n"
 		_ = os.WriteFile(scriptPath, []byte(content), 0644)
 	} else {
+		// POSIX .sh (bash, zsh, dash)
 		scriptPath := filepath.Join(e.RepoPath, "cloneable-activate.sh")
-		content := fmt.Sprintf("#!/bin/sh\n# Source this file to activate the Cloneable Python environment\nsource \"$(dirname \"$0\")/%s/bin/activate\"\n", filepath.Base(venvPath))
+		content := "#!/bin/sh\n" +
+			"# Cloneable — activate the Python virtual environment\n" +
+			"# Usage: source cloneable-activate.sh\n" +
+			"_cloneable_dir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n" +
+			"if [ -f \"${_cloneable_dir}/" + venvBase + "/bin/activate\" ]; then\n" +
+			"    . \"${_cloneable_dir}/" + venvBase + "/bin/activate\"\n" +
+			"    # Ensure pip --user binaries are reachable\n" +
+			"    export PATH=\"${HOME}/.local/bin:${PATH}\"\n" +
+			"    echo \"Virtual environment activated.\"\n" +
+			"else\n" +
+			"    echo \"Error: virtual environment not found. Run 'cloneable --fix' to recreate it.\"\n" +
+			"fi\n"
 		_ = os.WriteFile(scriptPath, []byte(content), 0755)
+
+		// Fish shell variant
+		fishPath := filepath.Join(e.RepoPath, "cloneable-activate.fish")
+		fishContent := "# Cloneable — activate the Python virtual environment (Fish shell)\n" +
+			"# Usage: source cloneable-activate.fish\n" +
+			"set _cloneable_dir (dirname (status -f))\n" +
+			"if test -f \"$_cloneable_dir/" + venvBase + "/bin/activate.fish\"\n" +
+			"    source \"$_cloneable_dir/" + venvBase + "/bin/activate.fish\"\n" +
+			"    if not contains $HOME/.local/bin $PATH\n" +
+			"        set -gx PATH $HOME/.local/bin $PATH\n" +
+			"    end\n" +
+			"    echo 'Virtual environment activated.'\n" +
+			"else\n" +
+			"    echo 'Error: virtual environment not found. Run cloneable --fix to recreate it.'\n" +
+			"end\n"
+		_ = os.WriteFile(fishPath, []byte(fishContent), 0755)
 	}
 }
 

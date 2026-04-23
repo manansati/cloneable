@@ -293,9 +293,18 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 		if err != nil {
 			err = runIn(repoPath, log, envVars, pip, "install", ".")
 		}
+		// Auto-fix legacy python projects missing setuptools
+		if err != nil && strings.Contains(err.Error(), "pkg_resources") {
+			if log != nil {
+				log("[python] caught 'pkg_resources' error — injecting setuptools and retrying")
+			}
+			_ = runIn(repoPath, log, envVars, pip, "install", "setuptools")
+			err = runIn(repoPath, log, envVars, pip, "install", ".")
+		}
 		if err != nil {
 			return err
 		}
+		reqInstalled = true
 	}
 
 	// Strategy 4: Pipfile (Pipenv)
@@ -306,6 +315,25 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 		// Install pipenv into venv, then use it
 		_ = runIn(repoPath, log, envVars, pip, "install", "pipenv")
 		return runIn(repoPath, log, envVars, "pipenv", "install")
+	}
+
+	// Strategy 5: Poetry
+	if fileExists(repoPath, "poetry.lock") && !reqInstalled {
+		if commandExistsInPath("poetry") {
+			return runIn(repoPath, log, envVars, "poetry", "install", "--no-interaction")
+		}
+		// Install poetry into venv and use it
+		_ = runIn(repoPath, log, envVars, pip, "install", "poetry")
+		return runIn(repoPath, log, envVars, "poetry", "install", "--no-interaction")
+	}
+
+	// Strategy 6: conda environment.yml (best-effort, never fail)
+	if fileExists(repoPath, "environment.yml") && !reqInstalled {
+		if commandExistsInPath("conda") {
+			_ = runIn(repoPath, log, nil, "conda", "env", "create", "-f", "environment.yml", "--prefix", filepath.Join(repoPath, ".conda-env"), "--force")
+		} else if log != nil {
+			log("[python] environment.yml found but conda is not installed — skipping")
+		}
 	}
 
 	return nil
@@ -488,7 +516,15 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 		if logFn != nil {
 			logFn(fmt.Sprintf("removing %s", venv))
 		}
-		return os.RemoveAll(venv)
+		_ = os.RemoveAll(venv)
+		// Also remove activate scripts and __pycache__
+		for _, f := range []string{"cloneable-activate.sh", "cloneable-activate.bat", "cloneable-activate.fish"} {
+			_ = os.Remove(filepath.Join(repoPath, f))
+		}
+		_ = os.RemoveAll(filepath.Join(repoPath, "__pycache__"))
+		_ = os.RemoveAll(filepath.Join(repoPath, ".eggs"))
+		_ = os.RemoveAll(filepath.Join(repoPath, "*.egg-info"))
+		return nil
 
 	case detection.TechNode:
 		dirs := []string{
@@ -590,7 +626,7 @@ func runInWithTimeout(dir string, log pkgmanager.LogWriter, extraEnv []string, u
 	}
 
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		return fmt.Errorf("%s %s: %w\nOutput: %s", name, strings.Join(args, " "), err, string(out))
 	}
 	return nil
 }

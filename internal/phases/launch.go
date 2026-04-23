@@ -102,31 +102,54 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 
 	// ── Global install — always, no confirmation needed ───────────────────────
 	if isInstallable(profile.Primary, profile.Category) && len(profile.InstallCommands) > 0 {
-		var usedPipx bool
 		installErr := ui.RunWithSpinner("Installing globally", func() error {
 			if log != nil {
 				log.Section("Global Install")
 			}
 			extraEnv := envVarsForTech(profile.Primary, environment)
-			// Try without sudo first — most install commands now target ~/.local
+
+			if profile.Primary == detection.TechPython {
+				// Python PEP 668 strategy — NO pipx (avoids nested venvs):
+				// 1. Install into the .venv using the venv's pip (PEP 668 safe — targets .venv, not system)
+				// 2. MakeGlobal() then symlinks .venv/bin/<name> → ~/.local/bin/<name>
+				// 3. Last resort: pip install --user --break-system-packages
+
+				err := runIn(ctx.RepoPath, safeLog(), extraEnv,
+					environment.PipBin(), "install", ".")
+				if err != nil {
+					// Editable install might work where regular doesn't
+					err = runIn(ctx.RepoPath, safeLog(), extraEnv,
+						environment.PipBin(), "install", "-e", ".")
+				}
+
+				// Auto-fix legacy python projects missing setuptools in isolated build environments
+				if err != nil && strings.Contains(err.Error(), "pkg_resources") {
+					if log != nil {
+						log.Write("[install] caught 'pkg_resources' error — injecting setuptools and retrying")
+					}
+					_ = runIn(ctx.RepoPath, safeLog(), extraEnv, environment.PipBin(), "install", "setuptools")
+					err = runIn(ctx.RepoPath, safeLog(), extraEnv, environment.PipBin(), "install", ".")
+				}
+				if err != nil {
+					// Last resort: pip --user --break-system-packages (escapes venv intentionally)
+					if log != nil {
+						log.Write("[install] venv pip install failed — trying --user --break-system-packages")
+					}
+					err = runIn(ctx.RepoPath, safeLog(), nil,
+						"python3", "-m", "pip", "install", "--user", "--break-system-packages", ".")
+				}
+				return err
+			}
+
+			// Non-Python: try without sudo first, then with sudo
 			err := runIn(ctx.RepoPath, safeLog(), extraEnv,
 				profile.InstallCommands[0], profile.InstallCommands[1:]...)
 			if err != nil {
-				// Python fallback: if pip install fails (e.g. PEP 668), use pipx
-				if profile.Primary == detection.TechPython {
-					if log != nil {
-						log.Write("[install] pip install failed (possibly PEP 668) — retrying with pipx")
-					}
-					usedPipx = true
-					err = runIn(ctx.RepoPath, safeLog(), extraEnv, "pipx", "install", "--force", ".")
-				} else {
-					// Fallback: retry with sudo for commands that need /usr/local
-					if log != nil {
-						log.Write("[install] non-root install failed — retrying with sudo")
-					}
-					err = runInSudo(ctx.RepoPath, safeLog(), extraEnv,
-						profile.InstallCommands[0], profile.InstallCommands[1:]...)
+				if log != nil {
+					log.Write("[install] non-root install failed — retrying with sudo")
 				}
+				err = runInSudo(ctx.RepoPath, safeLog(), extraEnv,
+					profile.InstallCommands[0], profile.InstallCommands[1:]...)
 			}
 			return err
 		})
@@ -143,9 +166,20 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 		result.InstalledGlobally = true
 		result.BinaryName = ctx.RepoName
 
-		// Make it global (creates symlink in ~/.local/bin)
-		// For Python, if pipx was used, it automatically creates the symlink in ~/.local/bin, so we skip manual linking.
-		if !usedPipx {
+		// Symlink the binary from its env location to ~/.local/bin/
+		if profile.Primary == detection.TechPython {
+			names := detection.GetPythonBinaryNames(ctx.RepoPath, ctx.RepoName)
+			if len(names) > 0 {
+				result.BinaryName = names[0] // Primary name
+			}
+			for _, name := range names {
+				if err := environment.MakeGlobal(name, env.LogWriter(safeLog())); err != nil {
+					if log != nil {
+						log.Write(fmt.Sprintf("[launch] warning: MakeGlobal failed for %s: %s", name, err.Error()))
+					}
+				}
+			}
+		} else {
 			if err := environment.MakeGlobal(ctx.RepoName, env.LogWriter(safeLog())); err != nil {
 				if log != nil {
 					log.Write("[launch] warning: MakeGlobal failed: " + err.Error())
@@ -468,6 +502,11 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
+	// No arguments
+	if choice.Value == "__noargs__" {
+		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+	}
+
 	// Run with the selected argument
 	cmdArgs := append(profile.RunCommands[1:], choice.Value)
 	return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], cmdArgs...)
@@ -477,30 +516,58 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 // Never prints README — only applies configs.
 func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 	// Strategy 1: chezmoi
-	if fileExists(repoPath, ".chezmoi.yaml") || fileExists(repoPath, ".chezmoi.toml") {
+	if fileExists(repoPath, ".chezmoi.yaml") || fileExists(repoPath, ".chezmoi.toml") || fileExists(repoPath, ".chezmoiroot") {
 		fmt.Printf("\n  %s  Applying dotfiles with chezmoi...\n\n", ui.Saffron("→"))
 		return runInteractive(repoPath, nil, "chezmoi", "apply")
 	}
 
-	// Strategy 2: GNU stow
+	// Strategy 2: yadm (yet another dotfiles manager)
+	if fileExists(repoPath, ".yadm") || fileExists(repoPath, ".config/yadm") {
+		fmt.Printf("\n  %s  Applying dotfiles with yadm...\n\n", ui.Saffron("→"))
+		return runInteractive(repoPath, nil, "yadm", "bootstrap")
+	}
+
+	// Strategy 3: GNU stow
 	if commandExists("stow") && (fileExists(repoPath, ".stow-local-ignore") || hasDotfileDirs(repoPath)) {
 		fmt.Printf("\n  %s  Applying dotfiles with stow...\n\n", ui.Saffron("→"))
 		return runInteractive(repoPath, nil, "stow", "--target", os.Getenv("HOME"), ".")
 	}
 
-	// Strategy 3: install.sh / setup.sh
-	for _, script := range []string{"install.sh", "setup.sh", "bootstrap.sh"} {
+	// Strategy 4: Makefile install
+	if fileExists(repoPath, "Makefile") || fileExists(repoPath, "GNUmakefile") {
+		fmt.Printf("\n  %s  Running 'make install'...\n\n", ui.Saffron("→"))
+		return runInteractive(repoPath, nil, "make", "install")
+	}
+
+	// Strategy 5: install/setup/bootstrap scripts (OS-appropriate)
+	var scripts []string
+	if runtime.GOOS == "windows" {
+		scripts = []string{
+			"install.ps1", "setup.ps1", "bootstrap.ps1",
+			"install.bat", "setup.bat", "bootstrap.bat",
+			"install.sh", "setup.sh", "bootstrap.sh",
+		}
+	} else {
+		scripts = []string{
+			"install.sh", "setup.sh", "bootstrap.sh",
+			"install", "setup", "bootstrap",
+		}
+	}
+	for _, script := range scripts {
 		scriptPath := filepath.Join(repoPath, script)
 		if _, err := os.Stat(scriptPath); err == nil {
 			_ = os.Chmod(scriptPath, 0755)
 			fmt.Printf("\n  %s  Running %s...\n\n", ui.Saffron("→"), script)
+			if runtime.GOOS == "windows" && strings.HasSuffix(script, ".ps1") {
+				return runInteractive(repoPath, nil, "powershell", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+			}
 			return runInteractive(repoPath, nil, "bash", scriptPath)
 		}
 	}
 
-	// Strategy 4: show what's in the repo — don't print files, just tell user
+	// Strategy 6: show what's in the repo — don't print files, just tell user
 	fmt.Printf("\n  %s  Dotfiles cloned to: %s\n", ui.Tick(), ui.SaffronBold(repoPath))
-	fmt.Printf("  %s  No automatic installer found (no stow, chezmoi, or install.sh).\n", ui.Muted("→"))
+	fmt.Printf("  %s  No automatic installer found (no stow, chezmoi, yadm, or install script).\n", ui.Muted("→"))
 	fmt.Printf("  %s  Copy the config files you need manually.\n\n", ui.Muted("→"))
 	return nil
 }
@@ -508,13 +575,14 @@ func launchDotfiles(repoPath string, log pkgmanager.LogWriter) error {
 // launchDocs renders a markdown file beautifully in the terminal.
 // Strategy: try glow (best) → mdcat → built-in renderer (always available).
 func launchDocs(repoPath string, log pkgmanager.LogWriter) error {
-	// Find the best markdown file to display
+	// Find the best markdown file to display — case-insensitive check
 	mdFile := ""
 	for _, candidate := range []string{
-		"README.md", "readme.md", "README.markdown",
-		"docs/README.md", "docs/index.md",
+		"README.md", "readme.md", "Readme.md", "README.markdown",
+		"docs/README.md", "docs/index.md", "docs/readme.md",
 		"DOCS.md", "docs.md",
 		"GUIDE.md", "guide.md",
+		"CONTRIBUTING.md", "CHANGELOG.md",
 	} {
 		if fileExists(repoPath, candidate) {
 			mdFile = filepath.Join(repoPath, candidate)
@@ -522,9 +590,26 @@ func launchDocs(repoPath string, log pkgmanager.LogWriter) error {
 		}
 	}
 
+	// If no candidate matched, scan root for any .md file
+	if mdFile == "" {
+		entries, err := os.ReadDir(repoPath)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := strings.ToLower(entry.Name())
+				if strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".markdown") {
+					mdFile = filepath.Join(repoPath, entry.Name())
+					break
+				}
+			}
+		}
+	}
+
 	if mdFile == "" {
 		fmt.Printf("\n  %s  Documentation cloned to: %s\n", ui.Tick(), ui.SaffronBold(repoPath))
-		fmt.Printf("  %s  No README.md found — browse the files manually.\n\n", ui.Muted("→"))
+		fmt.Printf("  %s  No markdown files found — browse the files manually.\n\n", ui.Muted("→"))
 		return nil
 	}
 
@@ -798,7 +883,11 @@ func hasDotfileDirs(repoPath string) bool {
 	dotDirs := map[string]bool{
 		"nvim": true, "zsh": true, "bash": true, "fish": true,
 		"tmux": true, "hypr": true, "kitty": true, "alacritty": true,
-		"i3": true, "sway": true, "rofi": true,
+		"i3": true, "sway": true, "rofi": true, ".config": true,
+		"wezterm": true, "foot": true, "starship": true, "picom": true,
+		"bspwm": true, "awesome": true, "vim": true, ".vim": true,
+		"emacs": true, ".emacs.d": true, "dunst": true, "polybar": true,
+		"eww": true, "waybar": true,
 	}
 	for _, e := range entries {
 		if e.IsDir() && dotDirs[e.Name()] {

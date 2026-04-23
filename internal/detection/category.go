@@ -288,7 +288,16 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 				return []string{"python", entry}
 			}
 		}
-		return []string{"python", "-m", "."}
+		repoName := filepath.Base(repoPath)
+		if category == CategoryCLI {
+			// For CLI tools installed via pip, the binary might be different from the repo name.
+			names := GetPythonBinaryNames(repoPath, repoName)
+			return []string{names[0]}
+		}
+		
+		names := GetPythonBinaryNames(repoPath, repoName)
+		// Fallback to running it as a module
+		return []string{"python", "-m", names[0]}
 	case TechJava:
 		if fileExists(repoPath, "gradlew") {
 			return []string{"./gradlew", "run"}
@@ -341,6 +350,8 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 		return []string{"npm", "install", "-g", "."}
 	case TechPython:
 		// Install from the venv's pip (the venv env vars will be set by the caller).
+		// This is naturally PEP 668 compliant because it targets our isolated .venv
+		// and MakeGlobal() will handle the symlinking.
 		return []string{"pip", "install", "."}
 	case TechCpp, TechC:
 		if fileExists(repoPath, "CMakeLists.txt") {

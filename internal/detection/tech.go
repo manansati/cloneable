@@ -379,7 +379,7 @@ func systemDepsFor(repoPath string, tech TechType) []string {
 		return []string{"nodejs", "npm"}
 
 	case TechPython:
-		return []string{"python3", "python3-pip", "pipx"}
+		return []string{"python3", "python3-venv"}
 
 	case TechJava:
 		if fileExists(repoPath, "gradlew") || fileExists(repoPath, "build.gradle") || fileExists(repoPath, "build.gradle.kts") {
