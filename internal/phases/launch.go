@@ -59,8 +59,26 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 		return runFromSpec(ctx, profile.CloneableSpec, log)
 	}
 
+	// IF it's a library, don't build or run it.
+	if profile.Category == detection.CategoryLibrary {
+		fmt.Printf("\n  %s  %s is a library and cannot be run directly.\n\n", ui.Tick(), ctx.RepoName)
+		return result, nil
+	}
+
 	// ── Build step (compiled languages) ──────────────────────────────────────
 	if needsBuild(profile.Primary) {
+		// Error 7: On Windows, native compilation is not supported without MinGW/MSYS2.
+		// Rather than fail cryptically, show a clear error message.
+		if runtime.GOOS == "windows" && isNativeCompiled(profile.Primary) {
+			// TODO: Add MinGW/MSYS2 detection and support in a future release.
+			fmt.Printf("\n  %s  Compilation of %s projects is not yet supported on Windows.\n",
+				ui.Warn("!"), profile.Primary)
+			fmt.Printf("  %s  Native compilation requires toolchains (gcc, make, cmake) that\n", ui.Muted("→"))
+			fmt.Printf("  %s  are not available by default on Windows. Install MinGW or WSL,\n", ui.Muted("→"))
+			fmt.Printf("  %s  then try again. This will be fixed in a future release.\n\n", ui.Muted("→"))
+			return result, nil
+		}
+
 		buildErr := ui.RunWithSpinner("Building", func() error {
 			if log != nil {
 				log.Section("Build")
@@ -71,7 +89,7 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 					log.Write(s)
 				}
 			})
-			return buildProject(ctx.RepoPath, profile, environment, safeLog())
+			return buildProject(profile.WorkingDir, profile, environment, safeLog())
 		})
 		if buildErr != nil {
 			// Dependency error during build? Attempt Phase II retry once.
@@ -88,7 +106,7 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 					return nil, retryErr
 				}
 				// Retry build once
-				if err := buildProject(ctx.RepoPath, profile, environment, safeLog()); err != nil {
+				if err := buildProject(profile.WorkingDir, profile, environment, safeLog()); err != nil {
 					return nil, err
 				}
 			} else {
@@ -114,46 +132,63 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 				// 2. MakeGlobal() then symlinks .venv/bin/<name> → ~/.local/bin/<name>
 				// 3. Last resort: pip install --user --break-system-packages
 
-				err := runIn(ctx.RepoPath, safeLog(), extraEnv,
-					environment.PipBin(), "install", ".")
+				err := runIn(profile.WorkingDir, safeLog(), extraEnv,
+					environment.PipBin(), "install", "--no-build-isolation", ".")
 				if err != nil {
 					// Editable install might work where regular doesn't
-					err = runIn(ctx.RepoPath, safeLog(), extraEnv,
-						environment.PipBin(), "install", "-e", ".")
+					err = runIn(profile.WorkingDir, safeLog(), extraEnv,
+						environment.PipBin(), "install", "--no-build-isolation", "-e", ".")
 				}
 
-				// Auto-fix legacy python projects missing setuptools in isolated build environments
-				if err != nil && strings.Contains(err.Error(), "pkg_resources") {
+				// Auto-fix legacy python projects missing setuptools/pkg_resources/distutils
+				if err != nil && isLegacyPythonError(err) {
 					if log != nil {
-						log.Write("[install] caught 'pkg_resources' error — injecting setuptools and retrying")
+						log.Write("[install] caught legacy module error — injecting setuptools and retrying")
 					}
-					_ = runIn(ctx.RepoPath, safeLog(), extraEnv, environment.PipBin(), "install", "setuptools")
-					err = runIn(ctx.RepoPath, safeLog(), extraEnv, environment.PipBin(), "install", ".")
+					_ = runIn(profile.WorkingDir, safeLog(), extraEnv, environment.PipBin(), "install", "setuptools", "wheel", "packaging")
+					err = runIn(profile.WorkingDir, safeLog(), extraEnv, environment.PipBin(), "install", "--no-build-isolation", ".")
 				}
 				if err != nil {
 					// Last resort: pip --user --break-system-packages (escapes venv intentionally)
 					if log != nil {
 						log.Write("[install] venv pip install failed — trying --user --break-system-packages")
 					}
-					err = runIn(ctx.RepoPath, safeLog(), nil,
+					err = runIn(profile.WorkingDir, safeLog(), nil,
 						"python3", "-m", "pip", "install", "--user", "--break-system-packages", ".")
 				}
 				return err
 			}
 
-			// Non-Python: try without sudo first, then with sudo
-			err := runIn(ctx.RepoPath, safeLog(), extraEnv,
+			// Non-Python, non-Node: try without sudo first, then with sudo
+			if profile.Primary == detection.TechNode {
+				// Error 6: Validate package.json has a "name" field before npm install -g
+				// npm crashes with "Cannot destructure property 'name'" on malformed packages
+				if !hasValidPackageName(profile.WorkingDir) {
+					if log != nil {
+						log.Write("[install] package.json missing or has no 'name' field — skipping npm install -g")
+					}
+					fmt.Printf("\n  %s  %s is missing a 'name' field in package.json.\n", ui.Warn("!"), ctx.RepoName)
+					fmt.Printf("  %s  Skipping global installation.\n\n", ui.Muted("→"))
+					// Return special string so we can gracefully skip global install logic
+					return fmt.Errorf("SKIP_GLOBAL")
+				}
+			}
+
+			err := runIn(profile.WorkingDir, safeLog(), extraEnv,
 				profile.InstallCommands[0], profile.InstallCommands[1:]...)
 			if err != nil {
 				if log != nil {
 					log.Write("[install] non-root install failed — retrying with sudo")
 				}
-				err = runInSudo(ctx.RepoPath, safeLog(), extraEnv,
+				err = runInSudo(profile.WorkingDir, safeLog(), extraEnv,
 					profile.InstallCommands[0], profile.InstallCommands[1:]...)
 			}
 			return err
 		})
 		if installErr != nil {
+			if installErr.Error() == "SKIP_GLOBAL" {
+				return result, nil
+			}
 			if log != nil {
 				log.Error(installErr)
 			}
@@ -168,7 +203,7 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 
 		// Symlink the binary from its env location to ~/.local/bin/
 		if profile.Primary == detection.TechPython {
-			names := detection.GetPythonBinaryNames(ctx.RepoPath, ctx.RepoName)
+			names := detection.GetPythonBinaryNames(profile.WorkingDir, ctx.RepoName)
 			if len(names) > 0 {
 				result.BinaryName = names[0] // Primary name
 			}
@@ -203,33 +238,59 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 		// For compiled native apps (C, C++, Zig, Rust, Go, Haskell):
 		// the binary is now in PATH — just tell the user how to run it.
 		if isNativeCompiled(profile.Primary) {
-			// Find the actual binary name (might be different from repo name, e.g. neovim -> nvim)
+			// Find the actual binary name (might be different from repo name, e.g. neovim -> nvim, redis -> redis-server)
 			binPath, err := environment.FindBinary(ctx.RepoName)
 			actualName := ctx.RepoName
 			if err == nil {
 				actualName = filepath.Base(binPath)
 				result.BinaryName = actualName
+			} else {
+				// Error 8: Binary not found under repo name — try known name variants
+				// Many projects install binaries with different names (redis → redis-server, etc.)
+				variants := knownBinaryVariants(ctx.RepoName)
+				for _, variant := range variants {
+					if vPath, vErr := environment.FindBinary(variant); vErr == nil {
+						binPath = vPath
+						actualName = variant
+						result.BinaryName = actualName
+						err = nil
+						break
+					}
+				}
 			}
 
 			fmt.Printf("  %s  Run it with: %s\n\n",
 				ui.Muted("→"), ui.SaffronBold(actualName))
 
 			// Ask if they want to open it right now
+			// If it's a CLI tool, it's already in PATH — just tell them and exit
+			if profile.Category == detection.CategoryCLI {
+				return result, nil
+			}
+
 			shouldOpen, _ := ui.Confirm(fmt.Sprintf("Launch %s now?", actualName))
 			if !shouldOpen {
 				return result, nil
 			}
 
 			if err != nil {
-				// Discovery failed — check if it's in PATH now
-				if _, pathErr := exec.LookPath(actualName); pathErr != nil {
+				// Discovery failed — try exec.LookPath as last resort
+				// The PATH was just updated by EnsureBinDirInPath, so try again
+				for _, tryName := range append([]string{actualName}, knownBinaryVariants(ctx.RepoName)...) {
+					if foundPath, pathErr := exec.LookPath(tryName); pathErr == nil {
+						binPath = foundPath
+						err = nil
+						break
+					}
+				}
+				if err != nil {
 					return result, fmt.Errorf("could not find binary %q in search paths", actualName)
 				}
-				binPath = actualName
 			}
 
 			fmt.Println()
-			launchErr := runInteractive(ctx.RepoPath, nil, binPath)
+			// Use absolute path to avoid PATH cache issues in current process
+			launchErr := runInteractive(profile.WorkingDir, nil, binPath)
 			// CLI tools commonly exit with code 1 or 2 when invoked without
 			// arguments (they print usage and exit non-zero). This is expected
 			// behavior — the tool IS installed and working. Don't report it
@@ -241,6 +302,11 @@ func RunLaunch(ctx LaunchContext) (*LaunchResult, error) {
 		}
 
 		// For interpreted apps (Python, Node, etc.) — ask to open
+		if profile.Category == detection.CategoryCLI {
+			fmt.Printf("  %s  Run it from anywhere with: %s\n\n", ui.Muted("→"), ui.SaffronBold(ctx.RepoName))
+			return result, nil
+		}
+
 		shouldOpen, _ := ui.Confirm(fmt.Sprintf("Open %s now?", ctx.RepoName))
 		if !shouldOpen {
 			return result, nil
@@ -307,7 +373,7 @@ func isNativeCompiled(tech detection.TechType) bool {
 
 // isInstallable returns true for repos that should offer a global install.
 func isInstallable(tech detection.TechType, cat detection.RepoCategory) bool {
-	if cat == detection.CategoryDotfiles || cat == detection.CategoryDocs {
+	if cat == detection.CategoryDotfiles || cat == detection.CategoryDocs || cat == detection.CategoryLibrary {
 		return false
 	}
 	switch tech {
@@ -342,9 +408,53 @@ func buildProject(repoPath string, profile *detection.TechProfile, environment *
 		}
 		return runIn(repoPath, log, extraEnv, profile.BuildCommands[0], profile.BuildCommands[1:]...)
 
+	case detection.TechDotnet:
+		// Find specific .sln or .csproj to avoid MSB1011 error
+		project := findDotnetProjectInLaunch(repoPath)
+		if project != "" {
+			return runIn(repoPath, log, extraEnv, "dotnet", "build", project)
+		}
+		return runIn(repoPath, log, extraEnv, profile.BuildCommands[0], profile.BuildCommands[1:]...)
+
 	default:
 		return runIn(repoPath, log, extraEnv, profile.BuildCommands[0], profile.BuildCommands[1:]...)
 	}
+}
+
+// findDotnetProjectInLaunch is the launch-phase version of findDotnetProject.
+// It scans for .sln/.csproj files to specify to dotnet build.
+func findDotnetProjectInLaunch(repoPath string) string {
+	repoName := strings.ToLower(filepath.Base(repoPath))
+
+	type extCandidate struct {
+		ext string
+	}
+	for _, ec := range []extCandidate{{".sln"}, {".csproj"}, {".fsproj"}} {
+		var matches []string
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ec.ext) {
+				matches = append(matches, entry.Name())
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0]
+		}
+		if len(matches) > 1 {
+			// Pick the one matching repo name
+			for _, f := range matches {
+				base := strings.ToLower(strings.TrimSuffix(f, ec.ext))
+				if base == repoName || strings.Contains(repoName, base) || strings.Contains(base, repoName) {
+					return f
+				}
+			}
+			return matches[0]
+		}
+	}
+	return ""
 }
 
 // buildCpp handles the configure + build two-step for C/C++ projects.
@@ -427,7 +537,7 @@ func fileExistsAbs(path string) bool {
 
 // launchProject runs the project based on its tech and category.
 func launchProject(ctx LaunchContext, profile *detection.TechProfile, environment *env.Environment, log pkgmanager.LogWriter) error {
-	repoPath := ctx.RepoPath
+	repoPath := profile.WorkingDir
 	extraEnv := envVarsForTech(profile.Primary, environment)
 
 	switch profile.Category {
@@ -476,14 +586,14 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 	}
 
 	// First run --help to get available options
-	helpOutput := getHelpOutput(ctx.RepoPath, profile.RunCommands, extraEnv)
+	helpOutput := getHelpOutput(profile.WorkingDir, profile.RunCommands, extraEnv)
 
 	// Parse --help output into selector options
 	opts := parseHelpIntoOptions(helpOutput, ctx.RepoName)
 
 	if len(opts) == 0 {
 		// No parseable help — just run it directly
-		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(profile.WorkingDir, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Show arrow-key selector
@@ -493,23 +603,23 @@ func launchCLI(ctx LaunchContext, profile *detection.TechProfile, extraEnv []str
 	)
 	if err != nil || choice == nil {
 		// Cancelled — run without args
-		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(profile.WorkingDir, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Custom argument
 	if choice.Value == "__custom__" {
 		// TODO: show a text input — for now use the run command directly
-		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(profile.WorkingDir, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// No arguments
 	if choice.Value == "__noargs__" {
-		return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
+		return runInteractive(profile.WorkingDir, extraEnv, profile.RunCommands[0], profile.RunCommands[1:]...)
 	}
 
 	// Run with the selected argument
 	cmdArgs := append(profile.RunCommands[1:], choice.Value)
-	return runInteractive(ctx.RepoPath, extraEnv, profile.RunCommands[0], cmdArgs...)
+	return runInteractive(profile.WorkingDir, extraEnv, profile.RunCommands[0], cmdArgs...)
 }
 
 // launchDotfiles applies dotfiles using stow, chezmoi, or install scripts.
@@ -955,4 +1065,76 @@ func isCLIUsageExit(err error) bool {
 		return code == 1 || code == 2
 	}
 	return false
+}
+
+// hasValidPackageName checks if package.json exists and contains a valid "name" field.
+// npm install -g crashes with "Cannot destructure property 'name'" when the name
+// is missing or malformed. This prevents that cryptic error.
+func hasValidPackageName(repoPath string) bool {
+	data, err := os.ReadFile(filepath.Join(repoPath, "package.json"))
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	// Check for "name" field with a non-empty string value
+	nameIdx := strings.Index(content, `"name"`)
+	if nameIdx < 0 {
+		return false
+	}
+	// Find the colon after "name"
+	rest := content[nameIdx+len(`"name"`):]
+	colonIdx := strings.Index(rest, ":")
+	if colonIdx < 0 {
+		return false
+	}
+	// Find the value - should be a non-empty quoted string
+	valStr := strings.TrimSpace(rest[colonIdx+1:])
+	if len(valStr) < 2 || valStr[0] != '"' {
+		return false
+	}
+	// Find closing quote
+	endQuote := strings.Index(valStr[1:], `"`)
+	if endQuote <= 0 {
+		return false // empty name ""
+	}
+	return true
+}
+
+// knownBinaryVariants returns alternative binary names for well-known projects
+// where the binary name differs from the repository name.
+// This solves Error 8 (redis installs redis-server/redis-cli, not "redis").
+func knownBinaryVariants(repoName string) []string {
+	variants := map[string][]string{
+		"redis":    {"redis-server", "redis-cli", "redis-sentinel", "redis-benchmark"},
+		"neovim":   {"nvim"},
+		"neofetch": {"neofetch"},
+		"nginx":    {"nginx"},
+		"httpd":    {"httpd", "apache2"},
+		"postgres": {"postgres", "pg_ctl", "psql"},
+		"postgresql": {"postgres", "pg_ctl", "psql"},
+		"sqlite":   {"sqlite3"},
+		"tmux":     {"tmux"},
+		"vim":      {"vim"},
+		"emacs":    {"emacs"},
+		"gcc":      {"gcc", "g++"},
+		"llvm":     {"llc", "clang"},
+		"cmake":    {"cmake"},
+		"curl":     {"curl"},
+		"wget":     {"wget"},
+		"htop":     {"htop"},
+		"btop":     {"btop"},
+		"zsh":      {"zsh"},
+		"fish":     {"fish"},
+	}
+
+	if v, ok := variants[strings.ToLower(repoName)]; ok {
+		return v
+	}
+
+	// Also try with common prefixes/suffixes stripped
+	lower := strings.ToLower(repoName)
+	var guesses []string
+	// Try repo-name-d (daemon pattern: redis → redisd, but also redis-server)
+	guesses = append(guesses, lower+"-server", lower+"d", lower+"-cli")
+	return guesses
 }

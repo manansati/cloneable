@@ -22,6 +22,13 @@ func (e *Environment) FindBinary(name string) (string, error) {
 		}
 	}
 
+	// Fallback: If we couldn't find it by exact name, scan the primary output
+	// directory for this tech to see if there's ANY executable we can use.
+	fallbackPath := e.findAnyExecutableInOutputDir()
+	if fallbackPath != "" {
+		return fallbackPath, nil
+	}
+
 	return "", fmt.Errorf(
 		"could not find binary %q — looked in: %s",
 		name,
@@ -34,6 +41,9 @@ func (e *Environment) binarySearchPaths(name string) []string {
 
 	// Name mapping for known projects where repo name != binary name
 	names := []string{name}
+	if strings.Contains(name, "-") {
+		names = append(names, strings.ReplaceAll(name, "-", "_"))
+	}
 	if name == "neovim" {
 		names = append(names, "nvim")
 	}
@@ -112,6 +122,72 @@ func (e *Environment) binarySearchPaths(name string) []string {
 
 	return paths
 }
+
+// findAnyExecutableInOutputDir checks the primary compilation output directory
+// for the current technology. If it finds exactly one executable file, it returns it.
+// If it finds multiple, it tries to pick the one that looks most like a primary binary
+// (e.g. ignoring .so, .dll, or files with 'test' in the name).
+func (e *Environment) findAnyExecutableInOutputDir() string {
+	var outDir string
+	switch string(e.Tech) {
+	case "Rust":
+		outDir = filepath.Join(e.RepoPath, "target", "release")
+	case "Zig":
+		outDir = filepath.Join(e.RepoPath, "zig-out", "bin")
+		if !fileExists(outDir) {
+			outDir = filepath.Join(e.RepoPath, "zig-out")
+		}
+	case "C/C++", "C":
+		outDir = filepath.Join(e.RepoPath, "build")
+	case "Go":
+		// Go puts it in GOPATH/bin, which we already thoroughly check by name.
+		// If it's not there, it's not anywhere.
+		return ""
+	default:
+		return ""
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return ""
+	}
+
+	var executables []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(outDir, entry.Name())
+		if isExecutable(path) {
+			// Ignore common non-primary executables
+			name := strings.ToLower(entry.Name())
+			if strings.HasSuffix(name, ".so") || strings.HasSuffix(name, ".dll") || strings.HasSuffix(name, ".dylib") || strings.Contains(name, "test") {
+				continue
+			}
+			executables = append(executables, path)
+		}
+	}
+
+	// If we found exactly one viable executable, return it!
+	if len(executables) == 1 {
+		return executables[0]
+	}
+
+	// If we found multiple, try to find one that shares a prefix with the repo name
+	repoNameLower := strings.ToLower(e.RepoName)
+	if len(executables) > 1 {
+		for _, exe := range executables {
+			base := strings.ToLower(filepath.Base(exe))
+			base = strings.TrimSuffix(base, ".exe")
+			if strings.HasPrefix(repoNameLower, base) || strings.HasPrefix(base, repoNameLower) {
+				return exe
+			}
+		}
+	}
+
+	return ""
+}
+
 
 func isExecutable(path string) bool {
 	info, err := os.Stat(path)

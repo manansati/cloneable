@@ -141,16 +141,43 @@ func nodeIsLibrary(repoPath string) bool {
 }
 
 func rustIsCLI(repoPath string) bool {
-	data, err := os.ReadFile(filepath.Join(repoPath, "Cargo.toml"))
+	cargoPath := filepath.Join(repoPath, "Cargo.toml")
+	data, err := os.ReadFile(cargoPath)
 	if err != nil {
 		return false
 	}
 	content := string(data)
+
+	// If it's a virtual manifest, check subdirectories (members)
+	if strings.Contains(content, "[workspace]") && !strings.Contains(content, "[package]") {
+		// Look for any subdirectory with a Cargo.toml that looks like a CLI
+		entries, err := os.ReadDir(repoPath)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					if rustIsCLI(filepath.Join(repoPath, entry.Name())) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
 	// Rust CLI: has [[bin]] section, or depends on clap/structopt
 	return strings.Contains(content, "[[bin]]") ||
 		strings.Contains(content, `"clap"`) ||
 		strings.Contains(content, `"structopt"`) ||
 		strings.Contains(content, `"argh"`)
+}
+
+func isRustVirtualManifest(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	return strings.Contains(content, "[workspace]") && !strings.Contains(content, "[package]")
 }
 
 func rustIsLibrary(repoPath string) bool {
@@ -256,6 +283,11 @@ func BuildCommand(repoPath string, tech TechType) []string {
 	case TechRuby:
 		return []string{"bundle", "exec", "rake", "build"}
 	case TechDotnet:
+		// Find the specific project file to avoid MSB1011 multi-project error
+		project := findDotnetProjectFile(repoPath)
+		if project != "" {
+			return []string{"dotnet", "build", project}
+		}
 		return []string{"dotnet", "build"}
 	case TechHaskell:
 		if fileExists(repoPath, "stack.yaml") {
@@ -302,6 +334,19 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 		if fileExists(repoPath, "gradlew") {
 			return []string{"./gradlew", "run"}
 		}
+		if fileExists(repoPath, "mvnw") {
+			return []string{"./mvnw", "exec:java"}
+		}
+		// Error 3: Only use exec:java if pom.xml has mainClass configured
+		// Archetype/parent-only repos don't have a main class and will fail.
+		if fileExists(repoPath, "pom.xml") {
+			data, _ := os.ReadFile(filepath.Join(repoPath, "pom.xml"))
+			if data != nil && (strings.Contains(string(data), "mainClass") || strings.Contains(string(data), "exec-maven-plugin")) {
+				return []string{"mvn", "exec:java"}
+			}
+			// No main class — just package it
+			return []string{"mvn", "package"}
+		}
 		return []string{"mvn", "exec:java"}
 	case TechCpp, TechC:
 		// After build, the binary name matches the repo name.
@@ -320,6 +365,11 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 		}
 		return []string{"bundle", "exec", "ruby", "main.rb"}
 	case TechDotnet:
+		// Find the specific project file to avoid MSB1011 multi-project error
+		project := findDotnetProjectFile(repoPath)
+		if project != "" {
+			return []string{"dotnet", "run", "--project", project}
+		}
 		return []string{"dotnet", "run"}
 	case TechHaskell:
 		if fileExists(repoPath, "stack.yaml") {
@@ -345,6 +395,23 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 	case TechGo:
 		return []string{"go", "install", "./..."}
 	case TechRust:
+		if isRustVirtualManifest(filepath.Join(repoPath, "Cargo.toml")) {
+			// In a workspace, try to find a member that looks like a CLI
+			entries, err := os.ReadDir(repoPath)
+			if err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && rustIsCLI(filepath.Join(repoPath, entry.Name())) {
+						return []string{"cargo", "install", "--path", entry.Name()}
+					}
+				}
+			}
+			// Fallback for complex workspaces where we can't find the CLI member:
+			// Run cargo build --release instead of cargo install.
+			// It will be a fast no-op (since Phase III already built it), but it ensures
+			// this install step succeeds so Cloneable proceeds to symlink the binary
+			// from target/release to ~/.local/bin.
+			return []string{"cargo", "build", "--release"}
+		}
 		return []string{"cargo", "install", "--path", "."}
 	case TechNode:
 		return []string{"npm", "install", "-g", "."}
@@ -384,4 +451,36 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 func fileExists(repoPath, rel string) bool {
 	_, err := os.Stat(filepath.Join(repoPath, rel))
 	return err == nil
+}
+
+// findDotnetProjectFile scans the repo root for .sln or .csproj files.
+// If multiple exist, picks the one matching the repo name or the first found.
+// Returns empty string if only one exists (dotnet handles it fine by itself).
+func findDotnetProjectFile(repoPath string) string {
+	repoName := strings.ToLower(filepath.Base(repoPath))
+
+	for _, ext := range []string{".sln", ".csproj", ".fsproj"} {
+		var matches []string
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ext) {
+				matches = append(matches, entry.Name())
+			}
+		}
+		// Only specify the file if there are multiple (single file works fine without specifying)
+		if len(matches) > 1 {
+			// Pick the one matching repo name
+			for _, f := range matches {
+				base := strings.ToLower(strings.TrimSuffix(f, ext))
+				if base == repoName || strings.Contains(repoName, base) || strings.Contains(base, repoName) {
+					return f
+				}
+			}
+			return matches[0]
+		}
+	}
+	return ""
 }

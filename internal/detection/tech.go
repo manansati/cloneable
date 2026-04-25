@@ -49,6 +49,10 @@ type TechProfile struct {
 	// Below 70 = Cloneable will warn the user.
 	Confidence int
 
+	// WorkingDir is the directory where the primary manifest was found.
+	// Language-specific build/install commands should run here instead of RepoPath.
+	WorkingDir string
+
 	// Manifests are all manifest files that were found during scanning.
 	Manifests []FoundManifest
 }
@@ -89,6 +93,7 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 		Primary:    TechUnknown,
 		Category:   CategoryUnknown,
 		Confidence: 0,
+		WorkingDir: repoPath,
 	}
 
 	// ── Step 1: Check for cloneable.yaml ─────────────────────────────────────
@@ -126,6 +131,7 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 		if m.Entry.IsPrimary && profile.Primary == TechUnknown {
 			profile.Primary = m.Entry.Tech
 			profile.Confidence = m.Entry.Confidence
+			profile.WorkingDir = filepath.Dir(m.FullPath)
 			if m.Depth > 0 {
 				profile.Confidence = max(profile.Confidence-10, 50)
 			}
@@ -135,7 +141,11 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 	// Source-file tie-breaker: if the winner has confidence <= 100 and there
 	// is a competing primary at root with confidence >= 85, count actual source
 	// files to see which language dominates.
-	profile.Primary = refineBySourceFiles(repoPath, manifests, profile.Primary)
+	newPrimary := refineBySourceFiles(repoPath, manifests, profile.Primary)
+	if newPrimary != profile.Primary {
+		profile.Primary = newPrimary
+		profile.WorkingDir = repoPath
+	}
 
 	// ── Step 4.5: Structural heuristics fallback ──────────────────────────────
 	// If no primary manifest was found (or if we only found non-primary manifests like Makefile)
@@ -147,12 +157,39 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 			return profile, nil
 		}
 		if isDocsRepo(repoPath, false) {
-			profile.Primary = TechDocs
-			profile.Category = CategoryDocs
-			profile.Confidence = 70
-			return profile, nil
+			counts := countSourceFiles(repoPath)
+			totalSourceFiles := 0
+			for _, count := range counts {
+				totalSourceFiles += count
+			}
+			// Only treat as pure documentation if there are very few actual source files
+			if totalSourceFiles < 5 {
+				profile.Primary = TechDocs
+				profile.Category = CategoryDocs
+				profile.Confidence = 70
+				return profile, nil
+			}
 		}
-		if hasShellScripts(repoPath) {
+
+		// Fallback 1: If no manifest is present, try to guess the language by counting source files.
+		// Useful for raw script repos like system-design-primer.
+		counts := countSourceFiles(repoPath)
+		maxCount := 0
+		var dominant TechType
+		for lang, count := range counts {
+			if count > maxCount {
+				maxCount = count
+				dominant = lang
+			}
+		}
+		// Require at least 2 source files to guess the language
+		if maxCount >= 2 && dominant != TechUnknown {
+			profile.Primary = dominant
+			profile.Confidence = 40 // Low confidence, but enough to bypass the <30% error
+			// Note: We don't return early here, so Category can be determined properly later.
+		}
+
+		if hasShellScripts(repoPath) && profile.Primary == TechUnknown {
 			profile.Primary = TechScripts
 			profile.Category = CategoryScripts
 			profile.Confidence = 65
@@ -172,15 +209,15 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 	}
 
 	// ── Step 5: Determine category ────────────────────────────────────────────
-	profile.Category = DetermineCategory(repoPath, profile.Primary, manifests)
+	profile.Category = DetermineCategory(profile.WorkingDir, profile.Primary, manifests)
 
 	// ── Step 6: Determine system deps ─────────────────────────────────────────
-	profile.SystemDeps = systemDepsFor(repoPath, profile.Primary)
+	profile.SystemDeps = systemDepsFor(profile.WorkingDir, profile.Primary)
 
 	// ── Step 7: Determine build / run / install commands ─────────────────────
-	profile.BuildCommands = BuildCommand(repoPath, profile.Primary)
-	profile.RunCommands = RunCommand(repoPath, profile.Primary, profile.Category)
-	profile.InstallCommands = InstallGlobalCommand(repoPath, profile.Primary)
+	profile.BuildCommands = BuildCommand(profile.WorkingDir, profile.Primary)
+	profile.RunCommands = RunCommand(profile.WorkingDir, profile.Primary, profile.Category)
+	profile.InstallCommands = InstallGlobalCommand(profile.WorkingDir, profile.Primary)
 
 	return profile, nil
 }
@@ -570,28 +607,24 @@ func countSourceFiles(repoPath string) map[TechType]int {
 		".lua":  TechUnknown, // Lua — not a primary tech, but helps with neovim detection
 	}
 
-	// Walk src/, lib/, include/ and root — these are the most telling
-	searchDirs := []string{repoPath, "src", "lib", "include", "source"}
-
-	for _, dir := range searchDirs {
-		fullDir := dir
-		if dir != repoPath {
-			fullDir = filepath.Join(repoPath, dir)
-		}
-		entries, err := os.ReadDir(fullDir)
+	filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			continue
+			return nil
 		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".venv" || name == "__pycache__" {
+				return filepath.SkipDir
 			}
-			ext := strings.ToLower(filepath.Ext(entry.Name()))
-			if tech, ok := extToTech[ext]; ok && tech != TechUnknown {
-				counts[tech]++
-			}
+			return nil
 		}
-	}
+		
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if tech, ok := extToTech[ext]; ok && tech != TechUnknown {
+			counts[tech]++
+		}
+		return nil
+	})
 
 	// C and C++ are the same project type — merge them
 	if cCount, ok := counts[TechC]; ok {

@@ -318,37 +318,50 @@ func processInlineCode(text string) string {
 
 // processDelimited finds text between delimiter pairs and applies a style.
 func processDelimited(text, delim string, style func(string) string) string {
+	offset := 0
 	for {
-		start := strings.Index(text, delim)
+		start := strings.Index(text[offset:], delim)
 		if start < 0 {
 			break
 		}
+		start += offset
+
 		end := strings.Index(text[start+len(delim):], delim)
 		if end < 0 {
-			break
+			offset = start + len(delim)
+			continue
 		}
 		end += start + len(delim)
+
 		inner := text[start+len(delim) : end]
-		text = text[:start] + style(inner) + text[end+len(delim):]
+		styled := style(inner)
+		text = text[:start] + styled + text[end+len(delim):]
+		offset = start + len(styled)
 	}
 	return text
 }
 
 // processLinks converts [text](url) into styled links.
 func processLinks(text string) string {
+	offset := 0
 	for {
-		openBracket := strings.Index(text, "[")
+		openBracket := strings.Index(text[offset:], "[")
 		if openBracket < 0 {
 			break
 		}
+		openBracket += offset
+
 		closeBracket := strings.Index(text[openBracket:], "](")
 		if closeBracket < 0 {
-			break
+			offset = openBracket + 1
+			continue
 		}
 		closeBracket += openBracket
+
 		closeParen := strings.Index(text[closeBracket+2:], ")")
 		if closeParen < 0 {
-			break
+			offset = openBracket + 1
+			continue
 		}
 		closeParen += closeBracket + 2
 
@@ -357,6 +370,7 @@ func processLinks(text string) string {
 
 		styled := mdLink.Render(linkText) + " " + mdLinkURL.Render("("+linkURL+")")
 		text = text[:openBracket] + styled + text[closeParen+1:]
+		offset = openBracket + len(styled)
 	}
 	return text
 }

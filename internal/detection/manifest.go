@@ -205,10 +205,26 @@ func shouldSkipDir(name string) bool {
 
 // isDotfileRepo checks whether a repo looks like a dotfile collection
 // by looking for known config directory names.
+// Error 9: Also checks if the repo name contains "dots"/"dotfiles" as a strong signal.
 func isDotfileRepo(repoPath string) bool {
 	entries, err := os.ReadDir(repoPath)
 	if err != nil {
 		return false
+	}
+
+	// Check if repo name itself suggests dotfiles
+	repoName := strings.ToLower(filepath.Base(repoPath))
+	nameHintsDotfiles := strings.Contains(repoName, "dotfiles") ||
+		strings.Contains(repoName, "dots") ||
+		strings.Contains(repoName, "dot-") ||
+		strings.HasSuffix(repoName, "-dots") ||
+		strings.HasPrefix(repoName, ".") ||
+		strings.Contains(repoName, "config")
+
+	// If the name strongly hints at dotfiles, we don't even need hits.
+	// Many dotfile repos just have scripts and files at the root.
+	if nameHintsDotfiles {
+		return true
 	}
 
 	hits := 0
@@ -222,6 +238,7 @@ func isDotfileRepo(repoPath string) bool {
 			}
 		}
 	}
+
 	// 2+ known config dirs = very likely a dotfile repo
 	return hits >= 2
 }

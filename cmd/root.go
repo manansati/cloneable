@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 
 	"github.com/manansati/cloneable/internal/detection"
 	"github.com/manansati/cloneable/internal/git"
@@ -57,6 +59,12 @@ var rootCmd = &cobra.Command{
 }
 
 func Execute() {
+	// Error 5: On Windows, if the user double-clicked the exe (not running in a proper terminal),
+	// re-launch ourselves in cmd.exe so the TUI works correctly.
+	if runtime.GOOS == "windows" {
+		ensureWindowsTerminal()
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "\n  %s  %s\n\n", ui.Warn("error:"), err)
 		os.Exit(1)
@@ -280,3 +288,43 @@ func saveReceipt(
 
 	_ = store.Save(r)
 }
+
+// ensureWindowsTerminal checks if we're running in a proper terminal on Windows.
+// When the user double-clicks cloneable.exe, Windows launches it without a console.
+// This function detects that situation and re-launches in cmd.exe.
+func ensureWindowsTerminal() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	// Check if we have a proper console window by checking if stdin is a terminal.
+	// If not (e.g. double-clicked from Explorer), re-launch in cmd.exe.
+	if !isTerminal() {
+		// Re-launch ourselves in cmd.exe with all original arguments
+		exePath, err := os.Executable()
+		if err != nil {
+			return
+		}
+
+		args := []string{"/C", exePath}
+		args = append(args, os.Args[1:]...)
+		args = append(args, "& pause")
+
+		cmd := exec.Command("cmd.exe", args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Run()
+		os.Exit(0)
+	}
+}
+
+// isTerminal returns true if stdout appears to be a terminal.
+func isTerminal() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+

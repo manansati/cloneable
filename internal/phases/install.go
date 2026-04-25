@@ -66,6 +66,20 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 			return err
 		}
 		if profile.Confidence < 30 {
+			// Error 9: Before giving up, check if repo name hints at dotfiles.
+			// Repos like "hyprland-dots" may not have enough config dirs for
+			// auto-detection, but the name itself is a strong signal.
+			repoLower := strings.ToLower(ctx.RepoName)
+			if strings.Contains(repoLower, "dots") ||
+				strings.Contains(repoLower, "dotfile") ||
+				strings.Contains(repoLower, "config") ||
+				strings.Contains(repoLower, "rice") {
+				profile.Primary = detection.TechDotfile
+				profile.Category = detection.CategoryDotfiles
+				profile.Confidence = 60
+				return nil
+			}
+
 			return fmt.Errorf(
 				"could not confidently detect the technology in this repository\n"+
 					"  Detected: %s (confidence: %d%%)\n"+
@@ -79,10 +93,50 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		if log != nil {
 			log.Error(detectErr)
 		}
+		// Error 9: Even when detection fails, offer to render README.md
+		// so the user can follow manual installation instructions.
+		readmePath := ""
+		for _, candidate := range []string{"README.md", "readme.md", "Readme.md"} {
+			if fileExists(ctx.RepoPath, candidate) {
+				readmePath = filepath.Join(ctx.RepoPath, candidate)
+				break
+			}
+		}
+		if readmePath != "" {
+			fmt.Printf("\n  %s  Could not detect the technology in this repository.\n", ui.Warn("!"))
+			shouldRead, _ := ui.Confirm("Would you like to read the README.md for manual install instructions?")
+			if shouldRead {
+				fmt.Println()
+				_ = ui.RenderMarkdown(readmePath)
+			}
+		}
 		return nil, detectErr
 	}
 
 	result.Profile = profile
+
+	// If it's a dotfile repo, skip everything else and just prompt for README
+	if profile.Category == detection.CategoryDotfiles {
+		readmePath := ""
+		for _, candidate := range []string{"README.md", "readme.md", "Readme.md"} {
+			if fileExists(ctx.RepoPath, candidate) {
+				readmePath = filepath.Join(ctx.RepoPath, candidate)
+				break
+			}
+		}
+		if readmePath != "" {
+			fmt.Printf("\n  %s  %s appears to be a dotfiles repository.\n", ui.Tick(), ctx.RepoName)
+			shouldRead, _ := ui.Confirm("Would you like to read the README.md for manual install instructions?")
+			if shouldRead {
+				fmt.Println()
+				_ = ui.RenderMarkdown(readmePath)
+			}
+		} else {
+			fmt.Printf("\n  %s  %s appears to be a dotfiles repository.\n", ui.Tick(), ctx.RepoName)
+		}
+		// Return early - no dependencies/build needed for dotfiles
+		return result, nil
+	}
 
 	if log != nil {
 		log.Section("Tech Detection")
@@ -167,7 +221,7 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		if log != nil {
 			log.Section("Language Dependencies")
 		}
-		return installLanguageDeps(ctx.RepoPath, profile, environment, safeLog())
+		return installLanguageDeps(profile.WorkingDir, profile, environment, safeLog())
 	})
 	if langErr != nil {
 		if log != nil {
@@ -240,20 +294,29 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 	pip := environment.PipBin()
 	envVars := environment.PythonEnvVars()
 
-	// Upgrade pip and install wheel first to prevent legacy setup.py failures.
+	// Upgrade pip and install wheel + setuptools first to prevent legacy failures.
+	// This is critical for old repos that use pkg_resources, distutils, etc.
 	// Best-effort — don't fail if these don't work.
 	_ = runIn(repoPath, log, envVars, pip, "install", "--upgrade", "pip")
-	_ = runIn(repoPath, log, envVars, pip, "install", "wheel", "setuptools")
+	_ = runIn(repoPath, log, envVars, pip, "install", "wheel", "setuptools", "packaging")
 
 	reqInstalled := false
 
 	// Strategy 1: pyproject.toml (modern, PEP 517)
 	if fileExists(repoPath, "pyproject.toml") {
 		// Try editable install first (better for development)
-		err := runIn(repoPath, log, envVars, pip, "install", "-e", ".")
+		err := runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", "-e", ".")
 		if err != nil {
 			// Some projects don't support editable installs — try regular
-			err = runIn(repoPath, log, envVars, pip, "install", ".")
+			err = runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", ".")
+		}
+		// Auto-fix legacy modules missing in isolated build environments
+		if err != nil && isLegacyPythonError(err) {
+			if log != nil {
+				log("[python] caught legacy module error — injecting setuptools/pkg_resources and retrying")
+			}
+			_ = runIn(repoPath, log, envVars, pip, "install", "setuptools", "wheel", "packaging")
+			err = runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", ".")
 		}
 		if err == nil {
 			reqInstalled = true
@@ -265,6 +328,14 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 	// Strategy 2: requirements.txt
 	if fileExists(repoPath, "requirements.txt") {
 		err := runIn(repoPath, log, envVars, pip, "install", "-r", "requirements.txt")
+		// Auto-fix legacy module errors in requirements too
+		if err != nil && isLegacyPythonError(err) {
+			if log != nil {
+				log("[python] caught legacy module error in requirements.txt — injecting setuptools and retrying")
+			}
+			_ = runIn(repoPath, log, envVars, pip, "install", "setuptools", "wheel", "packaging")
+			err = runIn(repoPath, log, envVars, pip, "install", "-r", "requirements.txt")
+		}
 		if err == nil {
 			reqInstalled = true
 		} else if !reqInstalled {
@@ -289,17 +360,17 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 
 	// Strategy 3: setup.py (legacy)
 	if fileExists(repoPath, "setup.py") && !reqInstalled {
-		err := runIn(repoPath, log, envVars, pip, "install", "-e", ".")
+		err := runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", "-e", ".")
 		if err != nil {
-			err = runIn(repoPath, log, envVars, pip, "install", ".")
+			err = runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", ".")
 		}
-		// Auto-fix legacy python projects missing setuptools
-		if err != nil && strings.Contains(err.Error(), "pkg_resources") {
+		// Auto-fix legacy python projects missing setuptools/distutils/pkg_resources
+		if err != nil && isLegacyPythonError(err) {
 			if log != nil {
-				log("[python] caught 'pkg_resources' error — injecting setuptools and retrying")
+				log("[python] caught legacy module error — injecting setuptools and retrying")
 			}
-			_ = runIn(repoPath, log, envVars, pip, "install", "setuptools")
-			err = runIn(repoPath, log, envVars, pip, "install", ".")
+			_ = runIn(repoPath, log, envVars, pip, "install", "setuptools", "wheel")
+			err = runIn(repoPath, log, envVars, pip, "install", "--no-build-isolation", ".")
 		}
 		if err != nil {
 			return err
@@ -337,6 +408,34 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 	}
 
 	return nil
+}
+
+// isLegacyPythonError returns true if the error looks like a missing legacy Python module.
+// This covers pkg_resources, distutils, setuptools, and other common legacy errors
+// that old Python projects hit when building in modern isolated environments.
+func isLegacyPythonError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	signals := []string{
+		"pkg_resources",
+		"no module named 'setuptools'",
+		"no module named 'distutils'",
+		"modulenotfounderror: no module named",
+		"no module named 'wheel'",
+		"no module named 'packaging'",
+		"error in setup command",
+		"failed to build",
+		"legacy-install-failure",
+		"subprocess-exited-with-error",
+	}
+	for _, s := range signals {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func installNode(repoPath string, environment *env.Environment, log pkgmanager.LogWriter) error {
@@ -439,8 +538,79 @@ func installRuby(repoPath string, log pkgmanager.LogWriter) error {
 }
 
 func installDotnet(repoPath string, log pkgmanager.LogWriter) error {
-	_ = runIn(repoPath, log, nil, "dotnet", "restore")
+	// Find specific .sln or .csproj to avoid MSB1011 error
+	// ("more than one project or solution file")
+	project := findDotnetProject(repoPath)
+	if project != "" {
+		_ = runIn(repoPath, log, nil, "dotnet", "restore", project)
+	} else {
+		_ = runIn(repoPath, log, nil, "dotnet", "restore")
+	}
 	return nil
+}
+
+// findDotnetProject returns the best .sln or .csproj file to use.
+// Prefers .sln over .csproj. If multiple exist, picks the one matching
+// the repo name or the first alphabetically.
+func findDotnetProject(repoPath string) string {
+	repoName := strings.ToLower(filepath.Base(repoPath))
+
+	// First look for .sln files (solution files are preferred)
+	slnFiles := findFilesWithExt(repoPath, ".sln")
+	if len(slnFiles) == 1 {
+		return slnFiles[0]
+	}
+	if len(slnFiles) > 1 {
+		// Pick the one matching the repo name if possible
+		for _, f := range slnFiles {
+			base := strings.ToLower(strings.TrimSuffix(filepath.Base(f), ".sln"))
+			if base == repoName || strings.Contains(repoName, base) || strings.Contains(base, repoName) {
+				return f
+			}
+		}
+		return slnFiles[0] // Fall back to first
+	}
+
+	// Then look for .csproj files
+	csprojFiles := findFilesWithExt(repoPath, ".csproj")
+	if len(csprojFiles) == 1 {
+		return csprojFiles[0]
+	}
+	if len(csprojFiles) > 1 {
+		for _, f := range csprojFiles {
+			base := strings.ToLower(strings.TrimSuffix(filepath.Base(f), ".csproj"))
+			if base == repoName || strings.Contains(repoName, base) || strings.Contains(base, repoName) {
+				return f
+			}
+		}
+		return csprojFiles[0]
+	}
+
+	// Then look for .fsproj files
+	fsprojFiles := findFilesWithExt(repoPath, ".fsproj")
+	if len(fsprojFiles) >= 1 {
+		return fsprojFiles[0]
+	}
+
+	return "" // Let dotnet figure it out
+}
+
+// findFilesWithExt scans the repo root (non-recursive) for files with the given extension.
+func findFilesWithExt(repoPath, ext string) []string {
+	var results []string
+	entries, err := os.ReadDir(repoPath)
+	if err != nil {
+		return results
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ext) {
+			results = append(results, entry.Name())
+		}
+	}
+	return results
 }
 
 func installHaskell(repoPath string, log pkgmanager.LogWriter) error {
@@ -493,7 +663,7 @@ func RunFix(ctx InstallContext) (*InstallResult, error) {
 
 	// Clean broken state for this tech
 	cleanErr := ui.RunWithSpinner("Cleaning broken state", func() error {
-		return cleanBrokenState(ctx.RepoPath, profile.Primary, log)
+		return cleanBrokenState(ctx.RepoPath, profile.WorkingDir, profile.Primary, log)
 	})
 	if cleanErr != nil && log != nil {
 		log.Error(cleanErr)
@@ -504,7 +674,7 @@ func RunFix(ctx InstallContext) (*InstallResult, error) {
 }
 
 // cleanBrokenState removes known broken state for the given tech.
-func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logger) error {
+func cleanBrokenState(repoPath string, workingDir string, tech detection.TechType, log *logger.Logger) error {
 	var logFn pkgmanager.LogWriter
 	if log != nil {
 		logFn = log.Writer()
@@ -528,8 +698,8 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 
 	case detection.TechNode:
 		dirs := []string{
-			filepath.Join(repoPath, "node_modules"),
-			filepath.Join(repoPath, ".npm"),
+			filepath.Join(workingDir, "node_modules"),
+			filepath.Join(workingDir, ".npm"),
 		}
 		for _, d := range dirs {
 			if logFn != nil {
@@ -539,19 +709,19 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 		}
 
 	case detection.TechRust:
-		return runIn(repoPath, logFn, nil, "cargo", "clean")
+		return runIn(workingDir, logFn, nil, "cargo", "clean")
 
 	case detection.TechGo:
-		return runIn(repoPath, logFn, nil, "go", "clean", "-modcache")
+		return runIn(workingDir, logFn, nil, "go", "clean", "-modcache")
 
 	case detection.TechJava:
-		if fileExists(repoPath, "gradlew") {
-			return runIn(repoPath, logFn, nil, "./gradlew", "clean")
+		if fileExists(workingDir, "gradlew") {
+			return runIn(workingDir, logFn, nil, "./gradlew", "clean")
 		}
-		return runIn(repoPath, logFn, nil, "mvn", "clean")
+		return runIn(workingDir, logFn, nil, "mvn", "clean")
 
 	case detection.TechCpp, detection.TechC:
-		buildDir := filepath.Join(repoPath, "build")
+		buildDir := filepath.Join(workingDir, "build")
 		if logFn != nil {
 			logFn(fmt.Sprintf("removing %s", buildDir))
 		}
@@ -559,7 +729,7 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 
 	case detection.TechZig:
 		for _, dir := range []string{"zig-out", "zig-cache", ".zig-cache"} {
-			d := filepath.Join(repoPath, dir)
+			d := filepath.Join(workingDir, dir)
 			if logFn != nil {
 				logFn(fmt.Sprintf("removing %s", d))
 			}
@@ -569,12 +739,12 @@ func cleanBrokenState(repoPath string, tech detection.TechType, log *logger.Logg
 	case detection.TechFlutter, detection.TechDart:
 		// Remove .dart_tool and pubspec.lock for clean rebuild
 		for _, d := range []string{".dart_tool", ".flutter-plugins", ".flutter-plugins-dependencies"} {
-			os.RemoveAll(filepath.Join(repoPath, d)) //nolint:errcheck
+			os.RemoveAll(filepath.Join(workingDir, d)) //nolint:errcheck
 		}
 
 	case detection.TechDotnet:
 		for _, d := range []string{"bin", "obj"} {
-			os.RemoveAll(filepath.Join(repoPath, d)) //nolint:errcheck
+			os.RemoveAll(filepath.Join(workingDir, d)) //nolint:errcheck
 		}
 	}
 
@@ -596,12 +766,30 @@ func runInSudo(dir string, log pkgmanager.LogWriter, extraEnv []string, name str
 }
 
 func runInWithTimeout(dir string, log pkgmanager.LogWriter, extraEnv []string, useSudo bool, timeout time.Duration, name string, args ...string) error {
+	name = env.ResolveExecutable(name)
+
 	if useSudo && pkgmanager.NeedsSudo() {
-		args = append([]string{name}, args...)
+		// Pass essential environment variables to sudo so tools like rustup/cargo
+		// can find their configurations and don't fail when running as root.
+		envArgs := []string{
+			"HOME=" + os.Getenv("HOME"),
+			"PATH=" + os.Getenv("PATH"),
+		}
+		if cargoHome := os.Getenv("CARGO_HOME"); cargoHome != "" {
+			envArgs = append(envArgs, "CARGO_HOME="+cargoHome)
+		}
+		if rustupHome := os.Getenv("RUSTUP_HOME"); rustupHome != "" {
+			envArgs = append(envArgs, "RUSTUP_HOME="+rustupHome)
+		}
+		
+		// Build `sudo env HOME=... PATH=... cmd args...`
+		sudoArgs := append([]string{"env"}, envArgs...)
+		sudoArgs = append(sudoArgs, name)
+		sudoArgs = append(sudoArgs, args...)
+		
+		args = sudoArgs
 		name = "sudo"
 	}
-
-	name = env.ResolveExecutable(name)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
