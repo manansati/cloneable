@@ -29,7 +29,6 @@ var (
 
 )
 
-const itemsPerPage = 10
 const maxTotalItems = 30 // Increased slightly to 30 (3 pages of 10)
 
 type SearchModel struct {
@@ -48,7 +47,8 @@ type SearchModel struct {
 	loading   bool
 	fetching  bool 
 	apiPage   int  
-	err       error
+	itemsPerPage int
+	err          error
 }
 
 func NewSearchModel(query string, results []SearchResult, total int) SearchModel {
@@ -66,11 +66,12 @@ func NewSearchModel(query string, results []SearchResult, total int) SearchModel
 	}
 
 	return SearchModel{
-		query:      query,
-		results:    results,
-		totalCount: total,
-		textInput:  ti,
-		apiPage:    1,
+		query:        query,
+		results:      results,
+		totalCount:   total,
+		textInput:    ti,
+		apiPage:      1,
+		itemsPerPage: 10,
 	}
 }
 
@@ -104,6 +105,62 @@ func (m SearchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
 		m.width = msg.Width
+		
+		// Calculate overhead:
+		// Logo: 7 (full) or 4 (compact) lines
+		// Search: 3 lines
+		// Status: 3 lines
+		// Divider: 1 line
+		// Footer: 3 lines
+		// Total: ~17 (full) or ~14 (compact)
+		overhead := 17
+		if m.width < 85 || m.height < 28 {
+			overhead = 14
+		}
+		
+		// Each item takes 3 lines (name, desc, divider)
+		availableHeight := m.height - overhead
+		if availableHeight < 3 {
+			availableHeight = 3 // show at least one item
+		}
+		
+		newItemsPerPage := availableHeight / 3
+		
+		// Cap at 10 (normal) or 5 (small window as requested)
+		if m.height < 30 {
+			if newItemsPerPage > 5 {
+				newItemsPerPage = 5
+			}
+		} else {
+			if newItemsPerPage > 10 {
+				newItemsPerPage = 10
+			}
+		}
+		if newItemsPerPage < 1 {
+			newItemsPerPage = 1
+		}
+		
+		// If itemsPerPage changed, recalculate cursor/page to stay on the same absolute item
+		if m.itemsPerPage != 0 && m.itemsPerPage != newItemsPerPage {
+			oldIdx := m.page*m.itemsPerPage + m.cursor
+			m.itemsPerPage = newItemsPerPage
+			m.page = oldIdx / m.itemsPerPage
+			m.cursor = oldIdx % m.itemsPerPage
+			
+			// Bound checks
+			if m.page*m.itemsPerPage >= len(m.results) && len(m.results) > 0 {
+				m.page = (len(m.results) - 1) / m.itemsPerPage
+			}
+			itemsOnPage := len(m.results) - (m.page * m.itemsPerPage)
+			if itemsOnPage > m.itemsPerPage {
+				itemsOnPage = m.itemsPerPage
+			}
+			if m.cursor >= itemsOnPage {
+				m.cursor = itemsOnPage - 1
+			}
+		} else {
+			m.itemsPerPage = newItemsPerPage
+		}
 
 	case searchMsg:
 		m.loading = false
@@ -154,15 +211,21 @@ func (m SearchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "up", "k":
 				if m.cursor > 0 {
 					m.cursor--
+				} else if m.page > 0 {
+					m.page--
+					m.cursor = m.itemsPerPage - 1
 				}
 
 			case "down", "j":
-				itemsOnPage := len(m.results) - (m.page * itemsPerPage)
-				if itemsOnPage > itemsPerPage {
-					itemsOnPage = itemsPerPage
+				itemsOnPage := len(m.results) - (m.page * m.itemsPerPage)
+				if itemsOnPage > m.itemsPerPage {
+					itemsOnPage = m.itemsPerPage
 				}
 				if m.cursor < itemsOnPage-1 {
 					m.cursor++
+				} else if (m.page+1)*m.itemsPerPage < len(m.results) {
+					m.page++
+					m.cursor = 0
 				}
 
 			case "left", "h":
@@ -172,13 +235,13 @@ func (m SearchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case "right", "l":
-				if (m.page+1)*itemsPerPage < len(m.results) {
+				if (m.page+1)*m.itemsPerPage < len(m.results) {
 					m.page++
 					m.cursor = 0
 				}
 
 			case "enter", " ":
-				idx := m.page*itemsPerPage + m.cursor
+				idx := m.page*m.itemsPerPage + m.cursor
 				if idx < len(m.results) {
 					r := m.results[idx]
 					m.chosen = &r
@@ -202,8 +265,13 @@ func (m SearchModel) View() string {
 
 	var b strings.Builder
 
-	// Ascii Art
-	for _, line := range strings.Split(ui.AsciiArt, "\n") {
+	// Ascii Art - Responsive: use compact logo if height/width is small
+	logo := ui.AsciiArt
+	if m.width < 85 || m.height < 25 {
+		logo = ui.CompactLogo
+	}
+
+	for _, line := range strings.Split(logo, "\n") {
 		b.WriteString(ui.StyleSaffron.Render(" " + line) + "\n")
 	}
 	b.WriteString("\n")
@@ -257,8 +325,8 @@ func (m SearchModel) View() string {
 	}
 
 	// Page logic
-	start := m.page * itemsPerPage
-	end := start + itemsPerPage
+	start := m.page * m.itemsPerPage
+	end := start + m.itemsPerPage
 	if end > len(m.results) {
 		end = len(m.results)
 	}
@@ -300,12 +368,12 @@ func (m SearchModel) View() string {
 
 	// Pagination & Hints
 	b.WriteString("\n  ")
-	totalPages := (len(m.results) + itemsPerPage - 1) / itemsPerPage
+	totalPages := (len(m.results) + m.itemsPerPage - 1) / m.itemsPerPage
 	if totalPages == 0 {
 		totalPages = 1
 	}
-	b.WriteString(styleHint.Render(fmt.Sprintf("Page %d of %d   ", m.page+1, totalPages)))
-	b.WriteString(styleHint.Render("↑/↓: navigate   ←/→: page   /: search   enter: select   q: quit"))
+	b.WriteString(ui.StyleDim.Render(fmt.Sprintf("Page %d of %d   ", m.page+1, totalPages)))
+	b.WriteString(ui.StyleDim.Render("↑/↓: navigate   ←/→: page   /: search   enter: select   q: quit"))
 	b.WriteString("\n\n")
 
 	return b.String()

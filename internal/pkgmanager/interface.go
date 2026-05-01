@@ -102,6 +102,10 @@ func AuthenticateSudo() error {
 		return nil
 	}
 
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return fmt.Errorf("root privileges required but 'sudo' is not installed")
+	}
+
 	cmd := exec.Command("sudo", "-v")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -119,6 +123,9 @@ func AuthenticateSudo() error {
 // sudo reads the password from /dev/tty, so it works even during spinner animations.
 func sudoRun(logWriter LogWriter, name string, args ...string) error {
 	if NeedsSudo() {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return fmt.Errorf("sudo is required to run %s but is not installed", name)
+		}
 		args = append([]string{name}, args...)
 		name = "sudo"
 	}

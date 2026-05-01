@@ -173,6 +173,7 @@ func runFullFlow(rawURL string) error {
 		RepoPath:      cloneResult.ClonedPath,
 		RepoName:      cloneResult.RepoName,
 		OSInfo:        sysInfo,
+		PkgInfo:       pkgInfo,
 	})
 	if launchErr != nil {
 		if installResult.Log != nil {
@@ -223,6 +224,7 @@ func runInsideRepo() error {
 		RepoPath:      cwd,
 		RepoName:      repoName,
 		OSInfo:        sysInfo,
+		PkgInfo:       pkgInfo,
 	})
 	if launchErr != nil {
 		if installResult != nil && installResult.Log != nil {

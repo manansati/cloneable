@@ -322,12 +322,16 @@ func specTypeToTech(t string) TechType {
 // a project of the given tech type. These are installed via the package manager
 // in Phase II before the language-level dependencies are installed.
 func systemDepsFor(repoPath string, tech TechType) []string {
+	// Base tools needed by almost every build system or installer script
+	baseDeps := []string{"curl", "wget", "unzip", "tar", "git"}
+
+	var deps []string
 	switch tech {
 	case TechGo:
-		return []string{"git", "make"}
+		deps = append(baseDeps, "make")
 
 	case TechRust:
-		deps := []string{"gcc", "pkg-config", "make"}
+		deps = append(baseDeps, "gcc", "pkg-config", "make")
 		// Deep scan Cargo.toml + Cargo.lock for system lib signals
 		for _, file := range []string{"Cargo.toml", "Cargo.lock"} {
 			data, err := os.ReadFile(filepath.Join(repoPath, file))
@@ -367,7 +371,7 @@ func systemDepsFor(repoPath string, tech TechType) []string {
 
 	case TechZig:
 		// Zig projects scan build.zig for system library usage
-		deps := []string{"zig", "make", "pkg-config"}
+		deps = append(baseDeps, "zig", "make", "pkg-config")
 		data, err := os.ReadFile(filepath.Join(repoPath, "build.zig"))
 		if err == nil {
 			content := strings.ToLower(string(data))
@@ -413,19 +417,23 @@ func systemDepsFor(repoPath string, tech TechType) []string {
 		return deps
 
 	case TechNode:
-		return []string{"nodejs", "npm"}
+		deps = append(baseDeps, "nodejs", "npm", "build-essential")
+		return deps
 
 	case TechPython:
-		return []string{"python3", "python3-venv"}
+		deps = append(baseDeps, "python3", "python3-venv", "build-essential")
+		return deps
 
 	case TechJava:
 		if fileExists(repoPath, "gradlew") || fileExists(repoPath, "build.gradle") || fileExists(repoPath, "build.gradle.kts") {
-			return []string{"java", "gradle"}
+			deps = append(baseDeps, "java", "gradle")
+		} else {
+			deps = append(baseDeps, "java", "maven")
 		}
-		return []string{"java", "maven"}
+		return deps
 
 	case TechCpp, TechC:
-		deps := []string{"gcc", "g++", "make", "pkg-config"}
+		deps = append(baseDeps, "gcc", "g++", "make", "pkg-config")
 		// Scan CMakeLists.txt for find_package calls
 		data, err := os.ReadFile(filepath.Join(repoPath, "CMakeLists.txt"))
 		if err == nil {
@@ -462,15 +470,22 @@ func systemDepsFor(repoPath string, tech TechType) []string {
 	case TechDart:
 		return []string{"dart"}
 	case TechRuby:
-		return []string{"ruby", "bundler"}
+		deps = append(baseDeps, "ruby", "build-essential")
+		return deps
+
 	case TechDotnet:
-		return []string{"dotnet-sdk"}
+		deps = append(baseDeps, "dotnet-sdk")
+		return deps
+
 	case TechHaskell:
-		return []string{"ghc", "cabal-install"}
-	case TechDocker:
-		return []string{"docker"}
+		deps = append(baseDeps, "ghc", "cabal-install")
+		return deps
+
+	case TechDocker, TechDotfile, TechDocs, TechScripts, TechUnknown:
+		return baseDeps
 	}
-	return nil
+
+	return baseDeps
 }
 
 // appendUniq appends items to the slice only if they are not already present.

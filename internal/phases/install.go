@@ -153,6 +153,14 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	environment := env.NewEnvironment(ctx.RepoPath, ctx.RepoName, profile.Primary, ctx.OSInfo)
 	result.Env = environment
 
+	// ── Toolchain verification ────────────────────────────────────────────────
+	// Ensure the primary toolchain binary (cargo, go, zig, etc.) is available.
+	// If installed but not in PATH, this finds it at well-known locations.
+	// If missing entirely, this attempts to auto-install it.
+	_ = ui.RunWithSpinner("Verifying toolchain", func() error {
+		return environment.EnsureToolchain(safeLog())
+	})
+
 	envErr := ui.RunWithSpinner("Preparing environment", func() error {
 		return environment.Setup(safeLog())
 	})
@@ -223,6 +231,14 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		}
 		return installLanguageDeps(profile.WorkingDir, profile, environment, safeLog())
 	})
+	if langErr != nil {
+		// Retry once: re-verify toolchain and try again
+		if log != nil {
+			log.Write("[install] language dep install failed — retrying after toolchain re-check")
+		}
+		_ = environment.EnsureToolchain(safeLog())
+		langErr = installLanguageDeps(profile.WorkingDir, profile, environment, safeLog())
+	}
 	if langErr != nil {
 		if log != nil {
 			log.Error(langErr)
@@ -299,6 +315,19 @@ func installPython(repoPath string, environment *env.Environment, log pkgmanager
 	// Best-effort — don't fail if these don't work.
 	_ = runIn(repoPath, log, envVars, pip, "install", "--upgrade", "pip")
 	_ = runIn(repoPath, log, envVars, pip, "install", "wheel", "setuptools", "packaging")
+
+	// ── Pre-install heavyweight build dependencies ────────────────────────────
+	// Some projects (like vLLM) require packages like torch to be present
+	// during the metadata generation phase of pip install. Without this,
+	// pip fails with "ModuleNotFoundError: No module named 'torch'".
+	prereqs := scanPythonBuildPrereqs(repoPath)
+	if len(prereqs) > 0 {
+		if log != nil {
+			log(fmt.Sprintf("[python] pre-installing build prerequisites: %s", strings.Join(prereqs, ", ")))
+		}
+		prereqArgs := append([]string{"install"}, prereqs...)
+		_ = runIn(repoPath, log, envVars, pip, prereqArgs...)
+	}
 
 	reqInstalled := false
 
@@ -830,3 +859,122 @@ func fileExists(repoPath, rel string) bool {
 	_, err := os.Stat(filepath.Join(repoPath, rel))
 	return err == nil
 }
+
+// ── Python build prerequisites ───────────────────────────────────────────────
+
+// heavyweightPythonPackages maps package name prefixes to pip install names.
+// These are packages that must be pre-installed before pip can even generate
+// metadata for projects that depend on them (like vLLM needing torch).
+var heavyweightPythonPackages = map[string]string{
+	"torch":         "torch",
+	"torchvision":   "torchvision",
+	"torchaudio":    "torchaudio",
+	"tensorflow":    "tensorflow",
+	"jax":           "jax",
+	"jaxlib":        "jaxlib",
+	"numpy":         "numpy",
+	"scipy":         "scipy",
+	"cython":        "cython",
+	"meson-python":  "meson-python",
+	"meson":         "meson",
+	"scikit-build":  "scikit-build",
+	"scikit-build-core": "scikit-build-core",
+	"cmake":         "cmake",
+	"ninja":         "ninja",
+	"pybind11":      "pybind11",
+	"nanobind":      "nanobind",
+	"cffi":          "cffi",
+	"swig":          "swig",
+}
+
+// scanPythonBuildPrereqs scans pyproject.toml and setup.py for heavyweight
+// build dependencies that must be pre-installed before pip install can work.
+func scanPythonBuildPrereqs(repoPath string) []string {
+	seen := map[string]bool{}
+	var prereqs []string
+
+	addIfHeavy := func(dep string) {
+		// Normalize: strip version specifiers (e.g. "torch>=2.0" → "torch")
+		dep = strings.TrimSpace(dep)
+		name := dep
+		for _, sep := range []string{">=", "<=", "==", "!=", ">", "<", "~=", "[", ";"} {
+			if idx := strings.Index(name, sep); idx > 0 {
+				name = name[:idx]
+			}
+		}
+		name = strings.TrimSpace(strings.ToLower(name))
+		if pipName, ok := heavyweightPythonPackages[name]; ok && !seen[name] {
+			seen[name] = true
+			prereqs = append(prereqs, pipName)
+		}
+	}
+
+	// 1. pyproject.toml — [build-system].requires
+	if data, err := os.ReadFile(filepath.Join(repoPath, "pyproject.toml")); err == nil {
+		content := string(data)
+		// Find [build-system] section and extract requires = [...]
+		if idx := strings.Index(content, "[build-system]"); idx >= 0 {
+			section := content[idx:]
+			if reqIdx := strings.Index(section, "requires"); reqIdx >= 0 {
+				rest := section[reqIdx:]
+				if bracketStart := strings.Index(rest, "["); bracketStart >= 0 {
+					if bracketEnd := strings.Index(rest[bracketStart:], "]"); bracketEnd >= 0 {
+						reqList := rest[bracketStart+1 : bracketStart+bracketEnd]
+						// Parse comma-separated quoted strings
+						for _, item := range strings.Split(reqList, ",") {
+							item = strings.Trim(strings.TrimSpace(item), "\"'")
+							addIfHeavy(item)
+						}
+					}
+				}
+			}
+		}
+
+		// Also check [project].dependencies and [project.optional-dependencies]
+		if idx := strings.Index(content, "[project]"); idx >= 0 {
+			section := content[idx:]
+			// Find next section start or end
+			nextSection := strings.Index(section[1:], "\n[")
+			if nextSection < 0 {
+				nextSection = len(section)
+			} else {
+				nextSection++ // offset for the skipped first char
+			}
+			projSection := section[:nextSection]
+			if depIdx := strings.Index(projSection, "dependencies"); depIdx >= 0 {
+				rest := projSection[depIdx:]
+				if bracketStart := strings.Index(rest, "["); bracketStart >= 0 {
+					if bracketEnd := strings.Index(rest[bracketStart:], "]"); bracketEnd >= 0 {
+						depList := rest[bracketStart+1 : bracketStart+bracketEnd]
+						for _, item := range strings.Split(depList, ",") {
+							item = strings.Trim(strings.TrimSpace(item), "\"'")
+							addIfHeavy(item)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. setup.py — setup_requires and install_requires
+	if data, err := os.ReadFile(filepath.Join(repoPath, "setup.py")); err == nil {
+		content := string(data)
+		for _, key := range []string{"setup_requires", "install_requires"} {
+			if idx := strings.Index(content, key); idx >= 0 {
+				rest := content[idx:]
+				if bracketStart := strings.Index(rest, "["); bracketStart >= 0 {
+					if bracketEnd := strings.Index(rest[bracketStart:], "]"); bracketEnd >= 0 {
+						depList := rest[bracketStart+1 : bracketStart+bracketEnd]
+						for _, item := range strings.Split(depList, ",") {
+							item = strings.Trim(strings.TrimSpace(item), "\"'")
+							addIfHeavy(item)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return prereqs
+}
+

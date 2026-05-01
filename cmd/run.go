@@ -62,6 +62,7 @@ Example:
 			RepoPath:      cwd,
 			RepoName:      repoName,
 			OSInfo:        sysInfo,
+			PkgInfo:       pkgInfo,
 		})
 		if launchErr != nil {
 			return launchErr
