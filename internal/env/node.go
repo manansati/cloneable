@@ -3,6 +3,8 @@ package env
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/manansati/cloneable/internal/detection"
 )
 
 // setupNode prepares the Node.js environment.
@@ -13,6 +15,23 @@ import (
 //   - Symlinking the bin after install
 func (e *Environment) setupNode(log LogWriter) error {
 	e.EnvDir = filepath.Join(e.RepoPath, "node_modules")
+	
+	// On fresh Arch Linux installs, npm tries to install globals to /usr/lib/node_modules
+	// which is owned by root. This causes permission errors (exit 243).
+	// We force the prefix to ~/.local if we detect an unwritable default prefix.
+	home, err := os.UserHomeDir()
+	if err == nil {
+		localPrefix := filepath.Join(home, ".local")
+		if e.OSType == detection.OSLinux {
+			if log != nil {
+				log("[node] forcing npm prefix to " + localPrefix + " to avoid permission errors")
+			}
+			// Just set it unconditionally for this run using env vars later
+			// For global installs, npm uses prefix
+			_ = run(log, "npm", "config", "set", "prefix", localPrefix)
+		}
+	}
+
 	// node_modules is created by npm/yarn/pnpm install — nothing to do here
 	if log != nil {
 		log("[node] environment ready — node_modules will be created during dependency install")

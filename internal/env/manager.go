@@ -145,7 +145,7 @@ func (e *Environment) MakeGlobal(globalBinaryName string, log LogWriter) error {
 // It covers bash, zsh, fish, and POSIX .profile — all at once.
 func (e *Environment) EnsureBinDirInPath() {
 	pathEnv := os.Getenv("PATH")
-	if isInPath(e.BinDir, pathEnv) {
+	if IsInPath(e.BinDir, pathEnv) {
 		return
 	}
 
@@ -186,6 +186,17 @@ func appendToFile(path, content string) error {
 	defer f.Close()
 	_, err = f.WriteString(content)
 	return err
+}
+
+// IsInPath checks if a directory is in the PATH string.
+func IsInPath(dir, pathStr string) bool {
+	dir = filepath.Clean(dir)
+	for _, p := range strings.Split(pathStr, string(os.PathListSeparator)) {
+		if filepath.Clean(p) == dir {
+			return true
+		}
+	}
+	return false
 }
 
 // RemoveAll removes the isolated environment and all symlinks.

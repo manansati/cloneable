@@ -265,11 +265,7 @@ func (m SearchModel) View() string {
 
 	var b strings.Builder
 
-	// Ascii Art - Responsive: use compact logo if height/width is small
 	logo := ui.AsciiArt
-	if m.width < 85 || m.height < 25 {
-		logo = ui.CompactLogo
-	}
 
 	for _, line := range strings.Split(logo, "\n") {
 		b.WriteString(ui.StyleSaffron.Render(" " + line) + "\n")

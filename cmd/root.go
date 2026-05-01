@@ -7,6 +7,7 @@ import (
 	"runtime"
 
 	"github.com/manansati/cloneable/internal/detection"
+	"github.com/manansati/cloneable/internal/env"
 	"github.com/manansati/cloneable/internal/git"
 	"github.com/manansati/cloneable/internal/phases"
 	"github.com/manansati/cloneable/internal/receipt"
@@ -73,7 +74,6 @@ func Execute() {
 
 func init() {
 	rootCmd.AddCommand(cloneCmd)
-	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(infoCmd)
 	rootCmd.AddCommand(logsCmd)
@@ -84,7 +84,6 @@ func init() {
 	rootCmd.AddCommand(removeCmd)
 
 	rootCmd.Flags().BoolP("version", "v", false, "Print version information and exit")
-	rootCmd.Flags().BoolP("run", "r", false, "Launch the app in the current repository")
 	rootCmd.Flags().BoolP("fix", "f", false, "Fix broken dependencies and reinstall")
 	rootCmd.Flags().BoolP("info", "i", false, "Show language/technology breakdown of current repo")
 	rootCmd.Flags().BoolP("logs", "l", false, "View the installation logs for the current repo")
@@ -92,7 +91,7 @@ func init() {
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
 
 	rootCmd.SetUsageTemplate(`Usage:
-  cloneable <git-url>    Clone, install, and launch a repository
+  cloneable <git-url>    Clone and install dependencies for a repository
   cloneable              Explore trending repositories (or run inside cloned repo)
 
 Commands:
@@ -105,7 +104,6 @@ Commands:
   update         Update Cloneable
 
 Flags:
-  -r, --run      Launch the current repo
   -f, --fix      Fix broken dependencies
   -i, --info     Language breakdown (current repo)
   -l, --logs     View install logs
@@ -119,11 +117,6 @@ func rootRunE(cmd *cobra.Command, args []string) error {
 	if versionFlag {
 		printVersion()
 		return nil
-	}
-
-	runFlag, _ := cmd.Flags().GetBool("run")
-	if runFlag {
-		return runCmd.RunE(runCmd, args)
 	}
 
 	fixFlag, _ := cmd.Flags().GetBool("fix")
@@ -165,29 +158,20 @@ func runFullFlow(rawURL string) error {
 		PkgInfo:  pkgInfo,
 	})
 	if err != nil {
+		if installResult != nil && installResult.Log != nil {
+			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", err, ui.Warn("!"), installResult.Log.LogPath)
+		}
 		return err
 	}
 
-	launchResult, launchErr := phases.RunLaunch(phases.LaunchContext{
-		InstallResult: installResult,
-		RepoPath:      cloneResult.ClonedPath,
-		RepoName:      cloneResult.RepoName,
-		OSInfo:        sysInfo,
-		PkgInfo:       pkgInfo,
-	})
-	if launchErr != nil {
-		if installResult.Log != nil {
-			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", launchErr, ui.Warn("!"), installResult.Log.LogPath)
-		}
-		return launchErr
-	}
-
-	saveReceipt(cloneResult, installResult, launchResult, rawURL)
+	saveReceipt(cloneResult, installResult, rawURL)
 
 	if installResult.Log != nil {
 		fmt.Printf("\n  %s  Logs: %s\n\n",
 			ui.Muted("→"), ui.Muted(installResult.Log.LogPath))
 	}
+
+	offerPathIntegration(installResult)
 	return nil
 }
 
@@ -219,21 +203,30 @@ func runInsideRepo() error {
 		return err
 	}
 
-	_, launchErr := phases.RunLaunch(phases.LaunchContext{
-		InstallResult: installResult,
-		RepoPath:      cwd,
-		RepoName:      repoName,
-		OSInfo:        sysInfo,
-		PkgInfo:       pkgInfo,
-	})
-	if launchErr != nil {
-		if installResult != nil && installResult.Log != nil {
-			return fmt.Errorf("%w\n\n  %s  See install.logs: %s", launchErr, ui.Warn("!"), installResult.Log.LogPath)
-		}
-		return launchErr
+	offerPathIntegration(installResult)
+	return nil
+}
+
+func offerPathIntegration(installResult *phases.InstallResult) {
+	if installResult == nil || installResult.Env == nil || installResult.Env.BinDir == "" {
+		return
 	}
 
-	return nil
+	binDir := installResult.Env.BinDir
+	pathEnv := os.Getenv("PATH")
+	
+	// Skip if already in PATH
+	if env.IsInPath(binDir, pathEnv) {
+		return
+	}
+
+	fmt.Printf("\n  %s  %s\n", ui.SaffronBold("Path Integration"), ui.Muted("The installed tools are located in "+binDir))
+	shouldAdd, err := ui.Confirm(fmt.Sprintf("Would you like to add %s to your PATH?", binDir))
+	if err == nil && shouldAdd {
+		installResult.Env.EnsureBinDirInPath()
+	} else {
+		fmt.Printf("\n  %s  Done. You can run it manually from: %s\n\n", ui.Tick(), ui.SaffronBold(installResult.Env.RepoPath))
+	}
 }
 
 func isInsideGitRepo() bool {
@@ -248,7 +241,6 @@ func printVersion() {
 func saveReceipt(
 	cloneResult *git.CloneResult,
 	installResult *phases.InstallResult,
-	launchResult *phases.LaunchResult,
 	rawURL string,
 ) {
 	store, err := receipt.NewStore(sysInfo.ReceiptsDir)
@@ -279,11 +271,6 @@ func saveReceipt(
 				Target: sym.Target,
 			})
 		}
-	}
-
-	if launchResult != nil {
-		r.GloballyInstalled = launchResult.InstalledGlobally
-		r.BinaryName = launchResult.BinaryName
 	}
 
 	r.Version = git.DefaultBranch(cloneResult.ClonedPath)

@@ -17,11 +17,6 @@ const AsciiArt = ` ██████╗██╗      ██████╗ █
 ╚██████╗███████╗╚██████╔╝██║ ╚████║███████╗██║  ██║██████╔╝███████╗███████╗
  ╚═════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝`
 
-// CompactLogo is a smaller version for narrow terminals (Windows cmd, etc.)
-const CompactLogo = `  ╔═╗┬  ┌─┐┌┐┌┌─┐┌─┐┌┐ ┬  ┌─┐
-  ║  │  │ ││││├┤ ├─┤├┴┐│  ├┤ 
-  ╚═╝┴─┘└─┘┘└┘└─┘┴ ┴└─┘┴─┘└─┘`
-
 // HeaderInfo holds everything shown below the ASCII art banner.
 type HeaderInfo struct {
 	OS         string // e.g. "Linux", "macOS", "Windows"
@@ -64,18 +59,9 @@ func PrintHeader(info HeaderInfo) {
 
 	termWidth := getTerminalWidth()
 
-	// Error 5: On narrow terminals (< 85 cols, common on Windows cmd or small windows),
-	// use the compact logo to prevent wrapping and visual corruption.
-	if termWidth >= 85 {
-		// Full ASCII art — every line padded by 1 space, rendered in saffron
-		for _, line := range strings.Split(AsciiArt, "\n") {
-			fmt.Println(StyleSaffron.Render(" " + line))
-		}
-	} else {
-		// Compact logo for narrow terminals
-		for _, line := range strings.Split(CompactLogo, "\n") {
-			fmt.Println(StyleSaffron.Render(line))
-		}
+	// Full ASCII art — every line padded by 1 space, rendered in saffron
+	for _, line := range strings.Split(AsciiArt, "\n") {
+		fmt.Println(StyleSaffron.Render(" " + line))
 	}
 
 	fmt.Println()

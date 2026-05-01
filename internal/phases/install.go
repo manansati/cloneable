@@ -246,7 +246,94 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		return result, fmt.Errorf("dependency installation failed: %w", langErr)
 	}
 
+	// ── Build Project ─────────────────────────────────────────────────────────
+	if len(profile.BuildCommands) > 0 {
+		buildErr := ui.RunWithSpinner("Building project", func() error {
+			if log != nil {
+				log.Section("Build Phase")
+			}
+			return BuildProjectWithCascade(profile.WorkingDir, profile, environment, safeLog(), cascade, ctx.OSInfo)
+		})
+		if buildErr != nil {
+			if log != nil {
+				log.Error(buildErr)
+			}
+			return result, fmt.Errorf("build failed: %w", buildErr)
+		}
+	}
+
+	// ── Global Install (make install) ─────────────────────────────────────────
+	// Only for compiled languages that need `make install` to place binaries in ~/.local/bin
+	if profile.Primary == detection.TechC || profile.Primary == detection.TechCpp || profile.Primary == detection.TechZig {
+		if len(profile.InstallCommands) > 0 {
+			installErr := ui.RunWithSpinner("Installing binary", func() error {
+				if log != nil {
+					log.Section("Install Phase")
+				}
+				// Set PREFIX to ~/.local for CMake/Make
+				extraEnv := []string{
+					"PREFIX=" + environment.BinDir,
+					"CMAKE_INSTALL_PREFIX=" + environment.BinDir,
+				}
+				
+				// Handle sudo if needed for system paths, but we prefer ~/.local
+				// so we don't use sudoRun here
+				for _, cmd := range profile.InstallCommands {
+					parts := strings.Fields(cmd)
+					if len(parts) == 0 {
+						continue
+					}
+					err := runIn(profile.WorkingDir, safeLog(), extraEnv, parts[0], parts[1:]...)
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if installErr != nil && log != nil {
+				log.Error(installErr)
+				// We don't fail the whole process here, as the build succeeded.
+				// The user can manually symlink or copy the binary.
+			}
+		}
+	} else if len(profile.InstallCommands) > 0 {
+		// Other languages might have global install commands
+		// We execute them if present in cloneable spec
+		_ = ui.RunWithSpinner("Installing binary", func() error {
+			for _, cmd := range profile.InstallCommands {
+				parts := strings.Fields(cmd)
+				if len(parts) > 0 {
+					_ = runIn(profile.WorkingDir, safeLog(), nil, parts[0], parts[1:]...)
+				}
+			}
+			return nil
+		})
+	}
+
+	// Determine the global binary name and make it available
+	if !isLibraryOrDotfiles(profile.Category) {
+		binName := determineBinaryName(profile)
+		if binName != "" {
+			_ = environment.MakeGlobal(binName, safeLog())
+		}
+	}
+
 	return result, nil
+}
+
+func isLibraryOrDotfiles(cat detection.RepoCategory) bool {
+	return cat == detection.CategoryLibrary || cat == detection.CategoryDotfiles || cat == detection.CategoryDocs
+}
+
+func determineBinaryName(profile *detection.TechProfile) string {
+	if profile.HasCloneableSpec && profile.CloneableSpec.GlobalBin != "" {
+		return profile.CloneableSpec.GlobalBin
+	}
+	
+	// Fast fallback based on the repo name
+	// This relies on the environment finding the binary during MakeGlobal
+	name := filepath.Base(profile.WorkingDir)
+	return name
 }
 
 // installLanguageDeps installs the language-level dependencies for the repo.
@@ -556,6 +643,13 @@ func installFlutter(repoPath string, log pkgmanager.LogWriter) error {
 
 func installRuby(repoPath string, log pkgmanager.LogWriter) error {
 	if fileExists(repoPath, "Gemfile") {
+		if !commandExistsInPath("bundle") && !commandExistsInPath("bundler") {
+			if log != nil {
+				log("[ruby] bundle not found in PATH — attempting 'gem install bundler'")
+			}
+			_ = runIn(repoPath, log, nil, "gem", "install", "bundler")
+		}
+
 		err := runIn(repoPath, log, nil, "bundle", "install")
 		if err != nil {
 			// Some systems need --path vendor/bundle

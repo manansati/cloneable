@@ -30,7 +30,7 @@ func NewPhaseRunner() *PhaseRunner {
 		phases: []Phase{
 			{Name: "Cloning"},
 			{Name: "Installing dependencies"},
-			{Name: "Launching"},
+			{Name: "Finishing up"},
 		},
 	}
 }
