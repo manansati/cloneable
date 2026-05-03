@@ -287,7 +287,7 @@ func printPostInstallSummary(installResult *phases.InstallResult) {
 					}
 				} else {
 					fmt.Printf("\n  %s  You can run it directly:\n", ui.Muted("→"))
-					fmt.Printf("     %s/%s\n\n", binDir, binName)
+					fmt.Printf("     %q\n\n", filepath.Join(binDir, binName))
 				}
 			}
 		}
@@ -308,10 +308,10 @@ func printPostInstallSummary(installResult *phases.InstallResult) {
 		if len(installResult.Profile.RunCommands) > 0 {
 			runCmd = strings.Join(installResult.Profile.RunCommands, " ")
 		} else {
-			runCmd = "./" + binName
+			runCmd = fmt.Sprintf("%q", "./"+binName)
 		}
 		
-		fmt.Printf("     cd %s\n", ui.Muted(installResult.Profile.WorkingDir))
+		fmt.Printf("     cd %s\n", ui.Muted(fmt.Sprintf("%q", installResult.Profile.WorkingDir)))
 		fmt.Printf("     %s\n\n", ui.SaffronBold(runCmd))
 	}
 }

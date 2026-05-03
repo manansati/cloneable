@@ -1,6 +1,7 @@
 package env
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 
@@ -81,112 +82,49 @@ func (e *Environment) NodeEnvVars() []string {
 	}
 }
 
+// PackageJSON represents the standard Node.js package.json structure.
+type PackageJSON struct {
+	Name    string            `json:"name"`
+	Main    string            `json:"main"`
+	Bin     interface{}       `json:"bin"`
+	Scripts map[string]string `json:"scripts"`
+}
+
+func parsePackageJSON(path string) (*PackageJSON, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pkg PackageJSON
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return nil, err
+	}
+	return &pkg, nil
+}
+
 // NodeGlobalBinName reads package.json to find the "bin" field
 // and returns the binary name(s) declared for global install.
 // Returns empty slice if no bin field is found.
 func (e *Environment) NodeGlobalBinName() []string {
-	pkgJSON := filepath.Join(e.RepoPath, "package.json")
-	data, err := os.ReadFile(pkgJSON)
+	pkgJSONPath := filepath.Join(e.RepoPath, "package.json")
+	pkg, err := parsePackageJSON(pkgJSONPath)
 	if err != nil {
 		return nil
 	}
 
-	// Simple extraction — full JSON parsing happens in Phase III
-	// This is just for the env layer to know what binary to symlink.
-	names := extractBinNames(string(data))
-	return names
-}
-
-// extractBinNames extracts binary names from a package.json "bin" field.
-// Handles both string and object forms:
-//
-//	"bin": "myapp"
-//	"bin": { "myapp": "dist/cli.js", "myapp2": "dist/cli2.js" }
-func extractBinNames(content string) []string {
-	// Find "bin" key
-	binIdx := indexOf(content, `"bin"`)
-	if binIdx < 0 {
-		return nil
-	}
-
-	// Find the value after "bin":
-	colonIdx := indexOf(content[binIdx:], `:`)
-	if colonIdx < 0 {
-		return nil
-	}
-	rest := trimSpace(content[binIdx+colonIdx+1:])
-
 	var names []string
-
-	if len(rest) > 0 && rest[0] == '"' {
-		// String form: "bin": "myapp" — use the package name
-		nameIdx := indexOf(content, `"name"`)
-		if nameIdx >= 0 {
-			nameColon := indexOf(content[nameIdx:], `:`)
-			if nameColon >= 0 {
-				nameRest := trimSpace(content[nameIdx+nameColon+1:])
-				if len(nameRest) > 0 && nameRest[0] == '"' {
-					end := indexOf(nameRest[1:], `"`)
-					if end >= 0 {
-						names = append(names, nameRest[1:end+1])
-					}
-				}
-			}
+	switch v := pkg.Bin.(type) {
+	case string:
+		// If "bin" is a string, the binary name is the package name
+		if pkg.Name != "" {
+			names = append(names, pkg.Name)
 		}
-	} else if len(rest) > 0 && rest[0] == '{' {
-		// Object form: extract all keys
-		depth := 0
-		inStr := false
-		i := 0
-		for i < len(rest) {
-			ch := rest[i]
-			if ch == '"' && !inStr {
-				inStr = true
-				i++
-				end := indexOf(rest[i:], `"`)
-				if end >= 0 {
-					key := rest[i : i+end]
-					// Only add top-level keys (depth == 1 = inside the bin object)
-					if depth == 1 {
-						names = append(names, key)
-					}
-					i += end + 1
-				}
-				inStr = false
-				continue
-			}
-			if ch == '{' {
-				depth++
-			} else if ch == '}' {
-				depth--
-				if depth == 0 {
-					break
-				}
-			}
-			i++
+	case map[string]interface{}:
+		for key := range v {
+			names = append(names, key)
 		}
 	}
-
 	return names
-}
-
-// ── small string helpers (no regexp to keep binary size small) ────────────────
-
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
-}
-
-func trimSpace(s string) string {
-	i := 0
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
-		i++
-	}
-	return s[i:]
 }
 
 func fileExistsInRepo(repoPath, rel string) bool {
@@ -232,19 +170,16 @@ func commandExists(name string) bool {
 // or nil if no start script is found in package.json.
 func (e *Environment) NodeStartScript() []string {
 	pm := e.NodePackageManager()
-	pkgJSON := filepath.Join(e.RepoPath, "package.json")
-	data, err := os.ReadFile(pkgJSON)
-	if err != nil {
+	pkgJSONPath := filepath.Join(e.RepoPath, "package.json")
+	pkg, err := parsePackageJSON(pkgJSONPath)
+	if err != nil || pkg.Scripts == nil {
 		return []string{pm, "start"}
 	}
 
-	content := string(data)
-	// Check if "start" script is defined
-	if indexOf(content, `"start"`) >= 0 {
+	if _, ok := pkg.Scripts["start"]; ok {
 		return []string{pm, "start"}
 	}
-	// Check for "dev" script (common in Vite/Next.js projects)
-	if indexOf(content, `"dev"`) >= 0 {
+	if _, ok := pkg.Scripts["dev"]; ok {
 		return []string{pm, "run", "dev"}
 	}
 	// Fallback
@@ -254,30 +189,12 @@ func (e *Environment) NodeStartScript() []string {
 // NodeMainEntry returns the "main" field from package.json,
 // used as a fallback run command: node <main>.
 func (e *Environment) NodeMainEntry() string {
-	pkgJSON := filepath.Join(e.RepoPath, "package.json")
-	data, err := os.ReadFile(pkgJSON)
+	pkgJSONPath := filepath.Join(e.RepoPath, "package.json")
+	pkg, err := parsePackageJSON(pkgJSONPath)
 	if err != nil {
 		return ""
 	}
-
-	content := string(data)
-	mainIdx := indexOf(content, `"main"`)
-	if mainIdx < 0 {
-		return ""
-	}
-	colonIdx := indexOf(content[mainIdx:], `:`)
-	if colonIdx < 0 {
-		return ""
-	}
-	rest := trimSpace(content[mainIdx+colonIdx+1:])
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
-	}
-	end := indexOf(rest[1:], `"`)
-	if end < 0 {
-		return ""
-	}
-	return rest[1 : end+1]
+	return pkg.Main
 }
 
 
