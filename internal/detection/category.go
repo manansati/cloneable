@@ -240,6 +240,11 @@ func BuildCommand(repoPath string, tech TechType) []string {
 	case TechRust:
 		return []string{"cargo", "build", "--release"}
 	case TechNode:
+		// Only return a build command if package.json actually has a "build" script.
+		// Projects like fkill-cli don't have one and would fail with "missing script".
+		if !nodeHasBuildScript(repoPath) {
+			return nil
+		}
 		if fileExists(repoPath, "yarn.lock") {
 			return []string{"yarn", "build"}
 		}
@@ -281,7 +286,11 @@ func BuildCommand(repoPath string, tech TechType) []string {
 	case TechFlutter:
 		return []string{"flutter", "build"}
 	case TechRuby:
-		return []string{"bundle", "exec", "rake", "build"}
+		// Only build if there's a Rakefile with a build task
+		if fileExists(repoPath, "Rakefile") {
+			return []string{"bundle", "exec", "rake", "build"}
+		}
+		return nil
 	case TechDotnet:
 		// Find the specific project file to avoid MSB1011 multi-project error
 		project := findDotnetProjectFile(repoPath)
@@ -440,6 +449,9 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 	case TechDotnet:
 		return []string{"dotnet", "tool", "install", "--global", "."}
 	case TechScripts:
+		if fileExists(repoPath, "install.sh") {
+			return []string{"./install.sh"}
+		}
 		if fileExists(repoPath, "Makefile") || fileExists(repoPath, "GNUmakefile") {
 			return []string{"make", "install", "PREFIX=" + prefix}
 		}
@@ -451,6 +463,45 @@ func InstallGlobalCommand(repoPath string, tech TechType) []string {
 func fileExists(repoPath, rel string) bool {
 	_, err := os.Stat(filepath.Join(repoPath, rel))
 	return err == nil
+}
+
+// nodeHasBuildScript returns true if package.json contains a "build" script.
+// This prevents running `npm run build` on projects that don't have one
+// (like fkill-cli), which would fail with "missing script: build".
+func nodeHasBuildScript(repoPath string) bool {
+	data, err := os.ReadFile(filepath.Join(repoPath, "package.json"))
+	if err != nil {
+		return false
+	}
+	content := string(data)
+
+	// Find "scripts" section
+	scriptsIdx := strings.Index(content, `"scripts"`)
+	if scriptsIdx < 0 {
+		return false
+	}
+
+	// Look for "build" key within the scripts object
+	rest := content[scriptsIdx:]
+	braceIdx := strings.Index(rest, "{")
+	if braceIdx < 0 {
+		return false
+	}
+
+	// Find matching closing brace for scripts object
+	depth := 0
+	for i := braceIdx; i < len(rest); i++ {
+		if rest[i] == '{' {
+			depth++
+		} else if rest[i] == '}' {
+			depth--
+			if depth == 0 {
+				scriptsBlock := rest[braceIdx : i+1]
+				return strings.Contains(scriptsBlock, `"build"`)
+			}
+		}
+	}
+	return false
 }
 
 // findDotnetProjectFile scans the repo root for .sln or .csproj files.

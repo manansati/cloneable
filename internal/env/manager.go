@@ -143,6 +143,7 @@ func (e *Environment) MakeGlobal(globalBinaryName string, log LogWriter) error {
 
 // EnsureBinDirInPath writes PATH exports to every shell config found on this system.
 // It covers bash, zsh, fish, and POSIX .profile — all at once.
+// The caller is responsible for printing user-facing instructions.
 func (e *Environment) EnsureBinDirInPath() {
 	pathEnv := os.Getenv("PATH")
 	if IsInPath(e.BinDir, pathEnv) {
@@ -159,10 +160,7 @@ func (e *Environment) EnsureBinDirInPath() {
 	newPath := fmt.Sprintf("%s%c%s", e.BinDir, os.PathListSeparator, pathEnv)
 	os.Setenv("PATH", newPath)
 
-	fmt.Printf("\n  %s  Added %s to your PATH.\n", ui.Tick(), ui.Muted(e.BinDir))
-	if runtime.GOOS != "windows" {
-		fmt.Printf("  %s  %s\n\n", ui.Warn("!"), ui.SaffronBold("Restart your terminal to apply to future sessions."))
-	}
+	fmt.Printf("  %s  Added %s to your PATH.\n", ui.Tick(), ui.Muted(e.BinDir))
 }
 
 func fileExists(path string) bool {

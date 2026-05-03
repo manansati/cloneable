@@ -32,9 +32,24 @@ type InstallContext struct {
 
 // InstallResult is returned by RunInstall and passed to Phase III.
 type InstallResult struct {
-	Profile *detection.TechProfile
-	Env     *env.Environment
-	Log     *logger.Logger
+	Profile  *detection.TechProfile
+	Env      *env.Environment
+	Log      *logger.Logger
+
+	// BinaryName is the primary binary installed (e.g. "fastfetch", "lazygit").
+	// Empty for libraries, docs, and dotfiles.
+	BinaryName string
+
+	// InstalledGlobally is true if the binary was symlinked to ~/.local/bin.
+	// False if the user declined or the project doesn't produce a binary.
+	InstalledGlobally bool
+
+	// GlobalInstallError holds any error that occurred during the symlinking phase.
+	GlobalInstallError error
+
+	// NeedsRestart is true if the user's terminal needs to be restarted
+	// (because we had to add ~/.local/bin to their shell config).
+	NeedsRestart bool
 }
 
 // RunInstall runs the full Phase II: detect → env setup → system deps → language deps.
@@ -156,9 +171,10 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	// ── Toolchain verification ────────────────────────────────────────────────
 	// Ensure the primary toolchain binary (cargo, go, zig, etc.) is available.
 	// If installed but not in PATH, this finds it at well-known locations.
-	// If missing entirely, this attempts to auto-install it.
+	// If missing entirely, this attempts to auto-install it via package manager.
+	cascade := pkgmanager.NewCascade(ctx.OSInfo, ctx.PkgInfo)
 	_ = ui.RunWithSpinner("Verifying toolchain", func() error {
-		return environment.EnsureToolchain(safeLog())
+		return environment.EnsureToolchain(safeLog(), cascade)
 	})
 
 	envErr := ui.RunWithSpinner("Preparing environment", func() error {
@@ -172,7 +188,6 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	}
 
 	// ── System dependencies ───────────────────────────────────────────────────
-	cascade := pkgmanager.NewCascade(ctx.OSInfo, ctx.PkgInfo)
 
 	if len(profile.SystemDeps) > 0 {
 		// Authenticate sudo upfront so the password prompt doesn't get swallowed by the spinner
@@ -236,7 +251,7 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		if log != nil {
 			log.Write("[install] language dep install failed — retrying after toolchain re-check")
 		}
-		_ = environment.EnsureToolchain(safeLog())
+		_ = environment.EnsureToolchain(safeLog(), cascade)
 		langErr = installLanguageDeps(profile.WorkingDir, profile, environment, safeLog())
 	}
 	if langErr != nil {
@@ -262,59 +277,52 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 		}
 	}
 
-	// ── Global Install (make install) ─────────────────────────────────────────
-	// Only for compiled languages that need `make install` to place binaries in ~/.local/bin
-	if profile.Primary == detection.TechC || profile.Primary == detection.TechCpp || profile.Primary == detection.TechZig {
-		if len(profile.InstallCommands) > 0 {
-			installErr := ui.RunWithSpinner("Installing binary", func() error {
-				if log != nil {
-					log.Section("Install Phase")
-				}
-				// Set PREFIX to ~/.local for CMake/Make
-				extraEnv := []string{
-					"PREFIX=" + environment.BinDir,
-					"CMAKE_INSTALL_PREFIX=" + environment.BinDir,
-				}
-				
-				// Handle sudo if needed for system paths, but we prefer ~/.local
-				// so we don't use sudoRun here
-				for _, cmd := range profile.InstallCommands {
-					parts := strings.Fields(cmd)
-					if len(parts) == 0 {
-						continue
-					}
-					err := runIn(profile.WorkingDir, safeLog(), extraEnv, parts[0], parts[1:]...)
-					if err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-			if installErr != nil && log != nil {
-				log.Error(installErr)
-				// We don't fail the whole process here, as the build succeeded.
-				// The user can manually symlink or copy the binary.
-			}
-		}
-	} else if len(profile.InstallCommands) > 0 {
-		// Other languages might have global install commands
-		// We execute them if present in cloneable spec
-		_ = ui.RunWithSpinner("Installing binary", func() error {
-			for _, cmd := range profile.InstallCommands {
-				parts := strings.Fields(cmd)
-				if len(parts) > 0 {
-					_ = runIn(profile.WorkingDir, safeLog(), nil, parts[0], parts[1:]...)
-				}
-			}
-			return nil
-		})
-	}
-
-	// Determine the global binary name and make it available
+	// ── Ask user about global PATH install ────────────────────────────────────
 	if !isLibraryOrDotfiles(profile.Category) {
 		binName := determineBinaryName(profile)
+		result.BinaryName = binName
+
 		if binName != "" {
-			_ = environment.MakeGlobal(binName, safeLog())
+			fmt.Println() // spacing
+			shouldInstall, promptErr := ui.Confirm(fmt.Sprintf(
+				"Install %s globally to your PATH?", ui.SaffronBold(binName)))
+
+			if promptErr == nil && shouldInstall {
+				// Execute the language-specific install commands
+				if profile.Primary == detection.TechC || profile.Primary == detection.TechCpp || profile.Primary == detection.TechZig {
+					_ = ui.RunWithSpinner("Installing binary", func() error {
+						if log != nil {
+							log.Section("Install Phase")
+						}
+						return installCompiledBinary(profile.WorkingDir, profile, environment, safeLog())
+					})
+				} else if len(profile.InstallCommands) > 0 {
+					_ = ui.RunWithSpinner("Installing binary", func() error {
+						if log != nil {
+							log.Section("Install Phase")
+						}
+						extraEnv := envVarsForTech(profile.Primary, environment)
+						for _, cmd := range profile.InstallCommands {
+							parts := strings.Fields(cmd)
+							if len(parts) > 0 {
+								_ = runIn(profile.WorkingDir, safeLog(), extraEnv, parts[0], parts[1:]...)
+							}
+						}
+						return nil
+					})
+				}
+
+				if err := environment.MakeGlobal(binName, safeLog()); err != nil {
+					if safeLog() != nil {
+						safeLog()(fmt.Sprintf("[install] MakeGlobal failed: %v", err))
+					}
+					// Pass the error up instead of printing directly to avoid duplicate output
+					result.GlobalInstallError = err
+				} else {
+					result.InstalledGlobally = true
+				}
+			}
+			// If shouldInstall is false, InstalledGlobally remains false and root.go will handle the output.
 		}
 	}
 
@@ -334,6 +342,236 @@ func determineBinaryName(profile *detection.TechProfile) string {
 	// This relies on the environment finding the binary during MakeGlobal
 	name := filepath.Base(profile.WorkingDir)
 	return name
+}
+
+// installCompiledBinary attempts to install a compiled binary using multiple
+// fallback strategies. This fixes the fastfetch-style failure where cmake builds
+// succeed but the binary doesn't end up in PATH.
+//
+// Strategy order:
+//  1. cmake --install (with local prefix)
+//  2. sudo cmake --install (system prefix)
+//  3. meson install (for meson projects)
+//  4. make install PREFIX=~/.local
+//  5. sudo make install
+//  6. Manual symlink from build output directory
+func installCompiledBinary(workingDir string, profile *detection.TechProfile, environment *env.Environment, log pkgmanager.LogWriter) error {
+	home, _ := os.UserHomeDir()
+	prefix := filepath.Join(home, ".local")
+	buildDir := filepath.Join(workingDir, "build")
+
+	// Strategy 1: cmake --install with local prefix
+	if fileExists(workingDir, "CMakeLists.txt") && dirExists(buildDir) {
+		if log != nil {
+			log("[install] trying cmake --install with prefix " + prefix)
+		}
+		err := runIn(workingDir, log, nil, "cmake", "--install", buildDir, "--prefix", prefix)
+		if err == nil {
+			if log != nil {
+				log("[install] cmake --install succeeded")
+			}
+			return nil
+		}
+		if log != nil {
+			log(fmt.Sprintf("[install] cmake --install with local prefix failed: %v", err))
+		}
+
+		// Strategy 2: sudo cmake --install (system default prefix /usr/local)
+		if log != nil {
+			log("[install] trying sudo cmake --install (system prefix)")
+		}
+		err = runInSudo(workingDir, log, nil, "cmake", "--install", buildDir)
+		if err == nil {
+			return nil
+		}
+		if log != nil {
+			log(fmt.Sprintf("[install] sudo cmake --install failed: %v", err))
+		}
+	}
+
+	// Strategy 3: meson install
+	if fileExists(workingDir, "meson.build") && dirExists(buildDir) {
+		if log != nil {
+			log("[install] trying meson install")
+		}
+		err := runIn(workingDir, log, nil, "meson", "install", "-C", buildDir)
+		if err == nil {
+			return nil
+		}
+		// Try with sudo
+		err = runInSudo(workingDir, log, nil, "meson", "install", "-C", buildDir)
+		if err == nil {
+			return nil
+		}
+		if log != nil {
+			log(fmt.Sprintf("[install] meson install failed: %v", err))
+		}
+	}
+
+	// Strategy 4: make install PREFIX=~/.local
+	makefileDirs := []string{workingDir, buildDir}
+	for _, dir := range makefileDirs {
+		makefile := filepath.Join(dir, "Makefile")
+		if _, err := os.Stat(makefile); err != nil {
+			continue
+		}
+		if log != nil {
+			log("[install] trying make install PREFIX=" + prefix + " in " + dir)
+		}
+		err := runIn(dir, log, nil, "make", "install", "PREFIX="+prefix, "DESTDIR=")
+		if err == nil {
+			return nil
+		}
+
+		// Strategy 5: sudo make install
+		if log != nil {
+			log("[install] trying sudo make install")
+		}
+		err = runInSudo(dir, log, nil, "make", "install")
+		if err == nil {
+			return nil
+		}
+		if log != nil {
+			log(fmt.Sprintf("[install] make install failed: %v", err))
+		}
+	}
+
+	// Strategy 6: Zig build install
+	if profile.Primary == detection.TechZig {
+		if log != nil {
+			log("[install] trying zig build install -p " + prefix)
+		}
+		err := runIn(workingDir, log, nil, "zig", "build", "install", "-p", prefix)
+		if err == nil {
+			return nil
+		}
+	}
+
+	// Strategy 7: Manual symlink from build output
+	if log != nil {
+		log("[install] all install methods failed — attempting manual symlink from build output")
+	}
+	return symlinkBuildOutput(workingDir, profile, environment, log)
+}
+
+// symlinkBuildOutput scans the build directory for executables and symlinks
+// the most likely candidate to ~/.local/bin.
+func symlinkBuildOutput(workingDir string, profile *detection.TechProfile, environment *env.Environment, log pkgmanager.LogWriter) error {
+	binName := determineBinaryName(profile)
+	
+	// Directories to scan for the binary
+	searchDirs := []string{
+		filepath.Join(workingDir, "build"),
+		filepath.Join(workingDir, "build", "bin"),
+		filepath.Join(workingDir, "build", "src"),
+		filepath.Join(workingDir, "build", "Release"),
+		filepath.Join(workingDir, "zig-out", "bin"),
+	}
+
+	// First pass: look for exact name match
+	for _, dir := range searchDirs {
+		candidate := filepath.Join(dir, binName)
+		if isExecutableFile(candidate) {
+			return symlinkToLocalBin(candidate, binName, environment, log)
+		}
+	}
+
+	// Second pass: recursive scan for any executable matching the repo name
+	for _, dir := range searchDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if !isExecutableFile(path) {
+				continue
+			}
+			name := strings.ToLower(entry.Name())
+			repoName := strings.ToLower(binName)
+			// Skip shared libraries and test binaries
+			if strings.HasSuffix(name, ".so") || strings.HasSuffix(name, ".dll") ||
+				strings.HasSuffix(name, ".dylib") || strings.Contains(name, "test") {
+				continue
+			}
+			if strings.Contains(name, repoName) || strings.Contains(repoName, name) {
+				return symlinkToLocalBin(path, entry.Name(), environment, log)
+			}
+		}
+	}
+
+	// Third pass: find ANY single executable in the build output
+	for _, dir := range searchDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		var executables []string
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			name := strings.ToLower(entry.Name())
+			if isExecutableFile(path) && !strings.HasSuffix(name, ".so") && !strings.HasSuffix(name, ".dll") {
+				executables = append(executables, path)
+			}
+		}
+		if len(executables) == 1 {
+			base := filepath.Base(executables[0])
+			return symlinkToLocalBin(executables[0], base, environment, log)
+		}
+	}
+
+	return fmt.Errorf("could not find binary to install — check build output in %s/build/", workingDir)
+}
+
+// symlinkToLocalBin creates a symlink from source to ~/.local/bin/name
+func symlinkToLocalBin(source, name string, environment *env.Environment, log pkgmanager.LogWriter) error {
+	target := filepath.Join(environment.BinDir, name)
+	if err := os.MkdirAll(environment.BinDir, 0755); err != nil {
+		return err
+	}
+	// Remove existing symlink/file
+	_ = os.Remove(target)
+
+	if err := os.Symlink(source, target); err != nil {
+		// If symlink fails (e.g. cross-device), try copying
+		if log != nil {
+			log(fmt.Sprintf("[install] symlink failed, trying copy: %v", err))
+		}
+		data, readErr := os.ReadFile(source)
+		if readErr != nil {
+			return fmt.Errorf("could not read binary %s: %w", source, readErr)
+		}
+		if writeErr := os.WriteFile(target, data, 0755); writeErr != nil {
+			return fmt.Errorf("could not copy binary to %s: %w", target, writeErr)
+		}
+	}
+
+	environment.Symlinks = append(environment.Symlinks, env.Symlink{Source: source, Target: target})
+	if log != nil {
+		log(fmt.Sprintf("[install] installed %s → %s", source, target))
+	}
+	return nil
+}
+
+// isExecutableFile returns true if the path exists, is a file, and has execute permission.
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return info.Mode()&0111 != 0
+}
+
+// dirExists returns true if the path exists and is a directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // installLanguageDeps installs the language-level dependencies for the repo.

@@ -61,9 +61,14 @@ Examples:
 			return nil
 		}
 
-		// User picked a repo — run the full flow
-		fmt.Printf("\n  %s  Selected: %s\n\n",
+		// User picked a repo — show details and start flow
+		fmt.Printf("\n  %s  Selected: %s\n",
 			ui.Tick(), ui.SaffronBold(chosen.FullName))
+		if chosen.Description != "" {
+			fmt.Printf("  %s  %s\n", ui.Muted("→"), chosen.Description)
+		}
+		fmt.Printf("  %s  ⭐ %s  •  %s\n\n",
+			ui.Muted("→"), gh.FormatStars(chosen.Stars), chosen.Language)
 
 		return runFullFlow(chosen.CloneURL)
 	},

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/manansati/cloneable/internal/detection"
 	"github.com/manansati/cloneable/internal/env"
@@ -167,11 +169,11 @@ func runFullFlow(rawURL string) error {
 	saveReceipt(cloneResult, installResult, rawURL)
 
 	if installResult.Log != nil {
-		fmt.Printf("\n  %s  Logs: %s\n\n",
+		fmt.Printf("\n  %s  Logs: %s\n",
 			ui.Muted("→"), ui.Muted(installResult.Log.LogPath))
 	}
 
-	offerPathIntegration(installResult)
+	printPostInstallSummary(installResult)
 	return nil
 }
 
@@ -203,29 +205,131 @@ func runInsideRepo() error {
 		return err
 	}
 
-	offerPathIntegration(installResult)
+	printPostInstallSummary(installResult)
 	return nil
 }
 
-func offerPathIntegration(installResult *phases.InstallResult) {
-	if installResult == nil || installResult.Env == nil || installResult.Env.BinDir == "" {
+// printPostInstallSummary prints the final usage summary after installation.
+// Covers: success message, how to use the binary, PATH status, and restart needs.
+func printPostInstallSummary(installResult *phases.InstallResult) {
+	if installResult == nil {
 		return
 	}
 
-	binDir := installResult.Env.BinDir
-	pathEnv := os.Getenv("PATH")
-	
-	// Skip if already in PATH
-	if env.IsInPath(binDir, pathEnv) {
+	fmt.Println() // spacing
+
+	// ── Determine what was installed ──────────────────────────────────────────
+	binName := installResult.BinaryName
+	isLib := installResult.Profile != nil &&
+		(installResult.Profile.Category == detection.CategoryLibrary ||
+			installResult.Profile.Category == detection.CategoryDocs ||
+			installResult.Profile.Category == detection.CategoryDotfiles)
+
+	// ── Libraries / docs / dotfiles — no binary to run ───────────────────────
+	if isLib || binName == "" {
+		tech := "Unknown"
+		if installResult.Profile != nil {
+			tech = string(installResult.Profile.Primary)
+		}
+		fmt.Printf("  %s  %s project installed successfully!\n\n", ui.Tick(), ui.SaffronBold(tech))
 		return
 	}
 
-	fmt.Printf("\n  %s  %s\n", ui.SaffronBold("Path Integration"), ui.Muted("The installed tools are located in "+binDir))
-	shouldAdd, err := ui.Confirm(fmt.Sprintf("Would you like to add %s to your PATH?", binDir))
-	if err == nil && shouldAdd {
-		installResult.Env.EnsureBinDirInPath()
+	// ── Binary was installed globally ────────────────────────────────────────
+	if installResult.InstalledGlobally {
+		fmt.Printf("  %s  Installed successfully!\n\n", ui.Tick())
+
+		// Check if ~/.local/bin is in PATH
+		if installResult.Env != nil {
+			pathEnv := os.Getenv("PATH")
+			binDir := installResult.Env.BinDir
+
+			if env.IsInPath(binDir, pathEnv) {
+				// Already in PATH — print usage and rehash hint
+				fmt.Printf("  %s  Usage:\n", ui.Muted("→"))
+				fmt.Printf("     %s\n\n", ui.SaffronBold(binName))
+
+				shell := detectCurrentShell()
+				switch shell {
+				case "fish":
+					// Fish doesn't cache — ready immediately
+				case "zsh":
+					fmt.Printf("  %s  Run %s or open a new terminal to use.\n\n",
+						ui.Muted("→"), ui.SaffronBold("rehash"))
+				default:
+					fmt.Printf("  %s  Run %s or open a new terminal to use.\n\n",
+						ui.Muted("→"), ui.SaffronBold("hash -r"))
+				}
+			} else {
+				// Need to add to PATH
+				fmt.Printf("  %s  %s is installed at %s\n",
+					ui.Muted("→"), ui.SaffronBold(binName), ui.Muted(binDir))
+
+				shouldAdd, err := ui.Confirm(fmt.Sprintf("Add %s to your PATH?", binDir))
+				if err == nil && shouldAdd {
+					installResult.Env.EnsureBinDirInPath()
+					installResult.NeedsRestart = true
+
+					fmt.Printf("  %s  Usage (after restarting terminal):\n", ui.Muted("→"))
+					fmt.Printf("     %s\n\n", ui.SaffronBold(binName))
+
+					shell := detectCurrentShell()
+					switch shell {
+					case "zsh":
+						fmt.Printf("  %s  Restart your terminal, or run: %s\n\n",
+							ui.Warn("!"), ui.SaffronBold("source ~/.zshrc"))
+					case "fish":
+						fmt.Printf("  %s  Restart your terminal, or run: %s\n\n",
+							ui.Warn("!"), ui.SaffronBold("source ~/.config/fish/config.fish"))
+					default:
+						fmt.Printf("  %s  Restart your terminal, or run: %s\n\n",
+							ui.Warn("!"), ui.SaffronBold("source ~/.bashrc"))
+					}
+				} else {
+					fmt.Printf("\n  %s  You can run it directly:\n", ui.Muted("→"))
+					fmt.Printf("     %s/%s\n\n", binDir, binName)
+				}
+			}
+		}
+		return
+	}
+
+	// ── User declined global install or install failed ───────────────────────
+	if installResult.GlobalInstallError != nil {
+		fmt.Printf("  %s  No distinct binary was found to install globally.\n\n", ui.Warn("!"))
 	} else {
-		fmt.Printf("\n  %s  Done. You can run it manually from: %s\n\n", ui.Tick(), ui.SaffronBold(installResult.Env.RepoPath))
+		fmt.Printf("  %s  Build completed successfully! Skipped global install.\n\n", ui.Tick())
+	}
+
+	if installResult.Profile != nil {
+		fmt.Printf("  %s  To run the project locally:\n", ui.Muted("→"))
+		
+		runCmd := ""
+		if len(installResult.Profile.RunCommands) > 0 {
+			runCmd = strings.Join(installResult.Profile.RunCommands, " ")
+		} else {
+			runCmd = "./" + binName
+		}
+		
+		fmt.Printf("     cd %s\n", ui.Muted(installResult.Profile.WorkingDir))
+		fmt.Printf("     %s\n\n", ui.SaffronBold(runCmd))
+	}
+}
+
+// detectCurrentShell returns the current shell name (bash, zsh, fish).
+func detectCurrentShell() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return "bash"
+	}
+	base := filepath.Base(shell)
+	switch base {
+	case "zsh":
+		return "zsh"
+	case "fish":
+		return "fish"
+	default:
+		return "bash"
 	}
 }
 

@@ -75,6 +75,7 @@ var manifestTable = []ManifestEntry{
 	{File: "*.sln", Tech: TechDotnet, Confidence: 90, IsPrimary: true},
 	{File: "cabal.project", Tech: TechHaskell, Confidence: 95, IsPrimary: true},
 	{File: "stack.yaml", Tech: TechHaskell, Confidence: 95, IsPrimary: true},
+	{File: "install.sh", Tech: TechScripts, Confidence: 85, IsPrimary: true},
 
 	// ── Tier 3: Secondary / additive signals ─────────────────────────────────
 	{File: "docker-compose.yml", Tech: TechDocker, Confidence: 80, IsPrimary: false},

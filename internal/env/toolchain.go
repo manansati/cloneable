@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/manansati/cloneable/internal/detection"
+	"github.com/manansati/cloneable/internal/pkgmanager"
 )
 
 // ToolchainPaths maps each technology to the well-known directories where its
@@ -50,14 +51,86 @@ var toolchainBinaries = map[detection.TechType][]string{
 	detection.TechC:       {"gcc", "cmake"},
 }
 
+// companionTool describes an additional binary that must be present for a technology.
+type companionTool struct {
+	Binary   string            // e.g. "bundle"
+	Packages map[string]string // manager → package name
+}
+
+// companionTools maps each tech to additional binaries that must be present
+// beyond the primary toolchain binaries.
+var companionTools = map[detection.TechType][]companionTool{
+	detection.TechRuby: {
+		{Binary: "bundle", Packages: map[string]string{
+			"pacman": "ruby-bundler", "apt": "ruby-bundler", "dnf": "rubygem-bundler",
+			"zypper": "ruby-bundler", "apk": "ruby-bundler", "brew": "ruby",
+		}},
+		{Binary: "gem", Packages: map[string]string{
+			"pacman": "rubygems", "apt": "rubygems", "dnf": "rubygems",
+			"zypper": "ruby", "apk": "ruby", "brew": "ruby",
+		}},
+	},
+	detection.TechCpp: {
+		{Binary: "cmake", Packages: map[string]string{
+			"pacman": "cmake", "apt": "cmake", "dnf": "cmake",
+			"zypper": "cmake", "apk": "cmake", "brew": "cmake",
+		}},
+		{Binary: "make", Packages: map[string]string{
+			"pacman": "base-devel", "apt": "build-essential", "dnf": "make",
+			"zypper": "make", "apk": "make", "brew": "make",
+		}},
+		{Binary: "pkg-config", Packages: map[string]string{
+			"pacman": "pkgconf", "apt": "pkg-config", "dnf": "pkgconf-pkg-config",
+			"zypper": "pkg-config", "apk": "pkgconf", "brew": "pkg-config",
+		}},
+	},
+	detection.TechC: {
+		{Binary: "cmake", Packages: map[string]string{
+			"pacman": "cmake", "apt": "cmake", "dnf": "cmake",
+			"zypper": "cmake", "apk": "cmake", "brew": "cmake",
+		}},
+		{Binary: "make", Packages: map[string]string{
+			"pacman": "base-devel", "apt": "build-essential", "dnf": "make",
+			"zypper": "make", "apk": "make", "brew": "make",
+		}},
+	},
+	detection.TechNode: {
+		{Binary: "npx", Packages: map[string]string{
+			"pacman": "npm", "apt": "npm", "dnf": "npm",
+			"zypper": "npm", "apk": "npm", "brew": "node",
+		}},
+	},
+	detection.TechPython: {
+		{Binary: "pip3", Packages: map[string]string{
+			"pacman": "python-pip", "apt": "python3-pip", "dnf": "python3-pip",
+			"zypper": "python3-pip", "apk": "py3-pip", "brew": "python",
+		}},
+	},
+	detection.TechHaskell: {
+		{Binary: "cabal", Packages: map[string]string{
+			"pacman": "cabal-install", "apt": "cabal-install", "dnf": "cabal-install",
+			"zypper": "cabal-install", "apk": "cabal", "brew": "cabal-install",
+		}},
+		{Binary: "stack", Packages: map[string]string{
+			"pacman": "stack", "apt": "haskell-stack", "dnf": "stack",
+			"brew": "haskell-stack",
+		}},
+	},
+}
+
 // EnsureToolchain verifies that the required toolchain binaries for the given
 // tech are available. If a binary isn't in $PATH, it probes well-known install
 // directories and prepends them to $PATH. If the toolchain is completely missing,
-// it attempts to install it.
+// it attempts to install it via the system package manager.
 //
 // This is called BEFORE any language-level dependency installation or build
 // commands. It is the first line of defense against "command not found" errors.
-func (e *Environment) EnsureToolchain(log LogWriter) error {
+func (e *Environment) EnsureToolchain(log LogWriter, cascade ...*pkgmanager.Cascade) error {
+	var cas *pkgmanager.Cascade
+	if len(cascade) > 0 {
+		cas = cascade[0]
+	}
+
 	bins, ok := toolchainBinaries[e.Tech]
 	if !ok {
 		return nil // No specific toolchain needed
@@ -100,7 +173,7 @@ func (e *Environment) EnsureToolchain(log LogWriter) error {
 		if log != nil {
 			log(fmt.Sprintf("[toolchain] %q not found anywhere — attempting auto-install", bin))
 		}
-		if err := autoInstallToolchain(e.Tech, log); err != nil {
+		if err := autoInstallToolchain(e.Tech, bin, log, cas); err != nil {
 			if log != nil {
 				log(fmt.Sprintf("[toolchain] auto-install failed: %v", err))
 			}
@@ -124,6 +197,48 @@ func (e *Environment) EnsureToolchain(log LogWriter) error {
 				}
 			}
 		}
+
+		// Also check if it's now directly in PATH (some package managers add to PATH)
+		if !binaryExists(bin) {
+			// Try common system paths directly
+			for _, sysDir := range []string{"/usr/bin", "/usr/local/bin"} {
+				candidate := filepath.Join(sysDir, bin)
+				if _, err := os.Stat(candidate); err == nil {
+					prependToPath(sysDir)
+					if log != nil {
+						log(fmt.Sprintf("[toolchain] found %s at %s after install", bin, sysDir))
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Install companion tools (e.g., bundler for Ruby, cmake for C/C++)
+	if companions, ok := companionTools[e.Tech]; ok {
+		for _, comp := range companions {
+			if binaryExists(comp.Binary) {
+				continue
+			}
+			if log != nil {
+				log(fmt.Sprintf("[toolchain] companion tool %q not found — installing", comp.Binary))
+			}
+			if cas != nil {
+				managerName := cas.PrimaryName()
+				if pkg, ok := comp.Packages[managerName]; ok && pkg != "" {
+					var logFn pkgmanager.LogWriter
+					if log != nil {
+						logFn = pkgmanager.LogWriter(log)
+					}
+					_ = cas.Install(pkg, logFn)
+				}
+			} else {
+				// Fallback: try gem install for bundler specifically
+				if comp.Binary == "bundle" && binaryExists("gem") {
+					_ = runCmd(log, "gem", "install", "bundler")
+				}
+			}
+		}
 	}
 
 	return nil
@@ -142,17 +257,116 @@ func prependToPath(dir string) {
 	os.Setenv("PATH", dir+sep+current)
 }
 
-// autoInstallToolchain attempts to install a missing language toolchain.
-func autoInstallToolchain(tech detection.TechType, log LogWriter) error {
-	switch tech {
-	case detection.TechRust:
-		return installRustToolchain(log)
-	case detection.TechGo:
-		// Go is usually installed via package manager — handled by system deps
-		return fmt.Errorf("go must be installed via your package manager")
-	default:
-		return fmt.Errorf("auto-install not supported for %s", tech)
+// autoInstallToolchain attempts to install a missing language toolchain
+// using the system package manager or official installer scripts.
+func autoInstallToolchain(tech detection.TechType, bin string, log LogWriter, cascade *pkgmanager.Cascade) error {
+	// Map of tech → package names for each package manager
+	toolchainPackages := map[detection.TechType]map[string]string{
+		detection.TechGo: {
+			"pacman": "go", "apt": "golang", "dnf": "golang",
+			"zypper": "go", "apk": "go", "brew": "go",
+		},
+		detection.TechNode: {
+			"pacman": "nodejs", "apt": "nodejs", "dnf": "nodejs",
+			"zypper": "nodejs", "apk": "nodejs", "brew": "node",
+		},
+		detection.TechPython: {
+			"pacman": "python", "apt": "python3", "dnf": "python3",
+			"zypper": "python3", "apk": "python3", "brew": "python",
+		},
+		detection.TechRuby: {
+			"pacman": "ruby", "apt": "ruby-full", "dnf": "ruby",
+			"zypper": "ruby", "apk": "ruby", "brew": "ruby",
+		},
+		detection.TechJava: {
+			"pacman": "jdk-openjdk", "apt": "default-jdk", "dnf": "java-17-openjdk-devel",
+			"zypper": "java-17-openjdk-devel", "apk": "openjdk17", "brew": "openjdk",
+		},
+		detection.TechCpp: {
+			"pacman": "base-devel", "apt": "build-essential", "dnf": "gcc-c++",
+			"zypper": "gcc-c++", "apk": "build-base", "brew": "gcc",
+		},
+		detection.TechC: {
+			"pacman": "base-devel", "apt": "build-essential", "dnf": "gcc",
+			"zypper": "gcc", "apk": "build-base", "brew": "gcc",
+		},
+		detection.TechZig: {
+			"pacman": "zig", "apt": "zig", "dnf": "zig",
+			"brew": "zig",
+		},
+		detection.TechHaskell: {
+			"pacman": "ghc", "apt": "ghc", "dnf": "ghc",
+			"zypper": "ghc", "apk": "ghc", "brew": "ghc",
+		},
+		detection.TechDotnet: {
+			"pacman": "dotnet-sdk", "apt": "dotnet-sdk-8.0", "dnf": "dotnet-sdk-8.0",
+			"zypper": "dotnet-sdk-8.0", "brew": "dotnet",
+		},
+		detection.TechFlutter: {
+			"pacman": "flutter", "brew": "flutter",
+		},
+		detection.TechDart: {
+			"pacman": "dart", "apt": "dart", "brew": "dart",
+		},
 	}
+
+	// Special case: Rust uses rustup, not the package manager
+	if tech == detection.TechRust {
+		return installRustToolchain(log)
+	}
+
+	// Special case: Node.js — also install npm separately on some distros
+	if tech == detection.TechNode && bin == "npm" {
+		if cascade != nil {
+			var logFn pkgmanager.LogWriter
+			if log != nil {
+				logFn = pkgmanager.LogWriter(log)
+			}
+			managerName := cascade.PrimaryName()
+			npmPkg := pkgmanager.ResolvePackageName("npm", managerName)
+			_ = cascade.Install(npmPkg, logFn)
+		}
+		return nil
+	}
+
+	// Try the package manager cascade first
+	if cascade != nil {
+		pkgs, ok := toolchainPackages[tech]
+		if ok {
+			managerName := cascade.PrimaryName()
+			var logFn pkgmanager.LogWriter
+			if log != nil {
+				logFn = pkgmanager.LogWriter(log)
+			}
+
+			if pkg, ok := pkgs[managerName]; ok && pkg != "" {
+				if log != nil {
+					log(fmt.Sprintf("[toolchain] installing %s via %s (%s)", tech, managerName, pkg))
+				}
+				err := cascade.Install(pkg, logFn)
+				if err == nil {
+					return nil
+				}
+				if log != nil {
+					log(fmt.Sprintf("[toolchain] %s install via %s failed: %v", pkg, managerName, err))
+				}
+			}
+		}
+	}
+
+	// Fallback: try installing via generic resolved name
+	if cascade != nil {
+		var logFn pkgmanager.LogWriter
+		if log != nil {
+			logFn = pkgmanager.LogWriter(log)
+		}
+		resolved := pkgmanager.ResolvePackageName(bin, cascade.PrimaryName())
+		if err := cascade.Install(resolved, logFn); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("could not auto-install %s for %s — please install manually", bin, tech)
 }
 
 // installRustToolchain installs Rust via rustup (the official installer).
