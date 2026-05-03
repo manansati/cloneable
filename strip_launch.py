@@ -1,4 +1,4 @@
-# temp python file, will replace this with go lang
+# not using this file currently
 import re
 
 with open("internal/phases/launch.go", "r") as f:
