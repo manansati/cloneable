@@ -174,6 +174,16 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	// If installed but not in PATH, this finds it at well-known locations.
 	// If missing entirely, this attempts to auto-install it via package manager.
 	cascade := pkgmanager.NewCascade(ctx.OSInfo, ctx.PkgInfo)
+
+	// Authenticate sudo upfront if we might need it for toolchain or system deps.
+	if len(profile.SystemDeps) > 0 || profile.Primary != detection.TechUnknown {
+		if err := pkgmanager.AuthenticateSudo(); err != nil {
+			if log != nil {
+				log.Write(fmt.Sprintf("[sudo] upfront authentication failed: %v — subsequent system installs may fail", err))
+			}
+		}
+	}
+
 	_ = ui.RunWithSpinner("Verifying toolchain", func() error {
 		return environment.EnsureToolchain(safeLog(), cascade)
 	})
@@ -191,10 +201,6 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 	// ── System dependencies ───────────────────────────────────────────────────
 
 	if len(profile.SystemDeps) > 0 {
-		// Authenticate sudo upfront so the password prompt doesn't get swallowed by the spinner
-		// or trigger multiple times during individual package installs.
-		_ = pkgmanager.AuthenticateSudo()
-
 		sysErr := ui.RunWithSpinner("Installing system dependencies", func() error {
 			if log != nil {
 				log.Section("System Dependencies")

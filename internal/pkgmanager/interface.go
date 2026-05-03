@@ -95,10 +95,12 @@ func NeedsSudo() bool {
 	return os.Getuid() != 0
 }
 
+var authenticated = false
+
 // AuthenticateSudo runs 'sudo -v' to prompt the user for their password upfront.
 // This prevents multiple sudo prompts or prompts hidden behind a spinner.
 func AuthenticateSudo() error {
-	if !NeedsSudo() {
+	if !NeedsSudo() || authenticated {
 		return nil
 	}
 
@@ -112,6 +114,7 @@ func AuthenticateSudo() error {
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	if err == nil {
+		authenticated = true
 		// Clear the "[sudo] password for..." line
 		fmt.Print("\033[1A\033[2K")
 	}
