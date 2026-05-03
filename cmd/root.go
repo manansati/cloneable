@@ -331,6 +331,12 @@ func printPostInstallSummary(installResult *phases.InstallResult) {
 			fmt.Printf("  %s  To run the project locally:\n", ui.Muted("→"))
 			fmt.Printf("     cd %s\n", ui.Muted(fmt.Sprintf("%q", installResult.Profile.WorkingDir)))
 			fmt.Printf("     %s\n\n", ui.SaffronBold(runCmd))
+
+			if installResult.Profile.Primary == detection.TechPython {
+				fmt.Printf("  %s  Python virtual environment is ready at %s\n",
+					ui.Muted("→"), ui.Muted(".venv"))
+				fmt.Printf("     Activate it: %s\n\n", ui.SaffronBold("source cloneable-activate.sh"))
+			}
 		} else {
 			// No run command could be determined — offer README
 			offerReadme(installResult.Profile.WorkingDir)

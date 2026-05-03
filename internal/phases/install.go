@@ -320,12 +320,20 @@ func RunInstall(ctx InstallContext) (*InstallResult, error) {
 						return installCompiledBinary(profile.WorkingDir, profile, environment, safeLog())
 					})
 				} else if len(profile.InstallCommands) > 0 {
+					cmd := profile.InstallCommands[0]
+					args := profile.InstallCommands[1:]
+
+					// For Python, ensure we use the venv pip even for global install
+					if profile.Primary == detection.TechPython && cmd == "pip" && environment != nil {
+						cmd = environment.PipBin()
+					}
+
 					_ = ui.RunWithSpinner("Installing binary", func() error {
 						if log != nil {
 							log.Section("Install Phase")
 						}
 						extraEnv := envVarsForTech(profile.Primary, environment)
-						_ = runIn(profile.WorkingDir, safeLog(), extraEnv, profile.InstallCommands[0], profile.InstallCommands[1:]...)
+						_ = runIn(profile.WorkingDir, safeLog(), extraEnv, cmd, args...)
 						return nil
 					})
 				}
@@ -1253,6 +1261,24 @@ func runInSudo(dir string, log pkgmanager.LogWriter, extraEnv []string, name str
 }
 
 func runInWithTimeout(dir string, log pkgmanager.LogWriter, extraEnv []string, useSudo bool, timeout time.Duration, name string, args ...string) error {
+	// If name is not absolute, try to find it in the extraEnv PATH first
+	if !filepath.IsAbs(name) {
+		for _, envVar := range extraEnv {
+			if strings.HasPrefix(envVar, "PATH=") {
+				pathVal := strings.TrimPrefix(envVar, "PATH=")
+				sep := string(os.PathListSeparator)
+				for _, p := range strings.Split(pathVal, sep) {
+					candidate := filepath.Join(p, name)
+					if _, err := os.Stat(candidate); err == nil {
+						name = candidate
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
 	name = env.ResolveExecutable(name)
 
 	if useSudo && pkgmanager.NeedsSudo() {

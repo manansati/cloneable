@@ -57,6 +57,10 @@ type LogWriter func(line string)
 
 // NewEnvironment creates an Environment for the given repo and tech.
 func NewEnvironment(repoPath, repoName string, tech detection.TechType, osInfo *detection.OSInfo) *Environment {
+	absPath, err := filepath.Abs(repoPath)
+	if err == nil {
+		repoPath = absPath
+	}
 	return &Environment{
 		RepoPath: repoPath,
 		RepoName: repoName,

@@ -108,17 +108,30 @@ func (e *Environment) setupPython(log LogWriter) error {
 }
 
 // createActivateScript writes a helper script to easily activate the environment.
-// On Linux/macOS it creates both a .sh and optionally a Fish-compatible script.
-// On Windows it creates a .bat file.
+// It creates variants for all major shells: Bash/Zsh (.sh), Fish (.fish),
+// Windows Batch (.bat), and PowerShell (.ps1).
 func (e *Environment) createActivateScript(venvPath string) {
 	venvBase := filepath.Base(venvPath)
 	if runtime.GOOS == "windows" {
-		scriptPath := filepath.Join(e.RepoPath, "cloneable-activate.bat")
-		content := "@echo off\r\n" +
+		// Windows Batch (.bat)
+		batPath := filepath.Join(e.RepoPath, "cloneable-activate.bat")
+		batContent := "@echo off\r\n" +
 			"REM Cloneable — activate the Python virtual environment\r\n" +
 			"call \"%~dp0" + venvBase + "\\Scripts\\activate.bat\"\r\n" +
 			"echo Virtual environment activated.\r\n"
-		_ = os.WriteFile(scriptPath, []byte(content), 0644)
+		_ = os.WriteFile(batPath, []byte(batContent), 0644)
+
+		// PowerShell (.ps1)
+		psPath := filepath.Join(e.RepoPath, "cloneable-activate.ps1")
+		psContent := "# Cloneable — activate the Python virtual environment\n" +
+			"$VenvPath = Join-Path $PSScriptRoot \"" + venvBase + "\"\n" +
+			"if (Test-Path \"$VenvPath\\Scripts\\Activate.ps1\") {\n" +
+			"    . \"$VenvPath\\Scripts\\Activate.ps1\"\n" +
+			"    Write-Host \"Virtual environment activated.\"\n" +
+			"} else {\n" +
+			"    Write-Host \"Error: virtual environment not found.\" -ForegroundColor Red\n" +
+			"}\n"
+		_ = os.WriteFile(psPath, []byte(psContent), 0644)
 	} else {
 		// POSIX .sh (bash, zsh, dash)
 		scriptPath := filepath.Join(e.RepoPath, "cloneable-activate.sh")
