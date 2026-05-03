@@ -220,18 +220,25 @@ func printPostInstallSummary(installResult *phases.InstallResult) {
 
 	// ── Determine what was installed ──────────────────────────────────────────
 	binName := installResult.BinaryName
-	isLib := installResult.Profile != nil &&
+	isNonRunnable := installResult.Profile != nil &&
 		(installResult.Profile.Category == detection.CategoryLibrary ||
 			installResult.Profile.Category == detection.CategoryDocs ||
-			installResult.Profile.Category == detection.CategoryDotfiles)
+			installResult.Profile.Category == detection.CategoryDotfiles ||
+			installResult.Profile.Category == detection.CategoryUnknown)
 
-	// ── Libraries / docs / dotfiles — no binary to run ───────────────────────
-	if isLib || binName == "" {
+	// ── Libraries / docs / dotfiles / unknown — no binary to run ─────────────
+	if isNonRunnable || binName == "" {
 		tech := "Unknown"
 		if installResult.Profile != nil {
 			tech = string(installResult.Profile.Primary)
 		}
-		fmt.Printf("  %s  %s project installed successfully!\n\n", ui.Tick(), ui.SaffronBold(tech))
+		fmt.Printf("  %s  %s project installed successfully!\n", ui.Tick(), ui.SaffronBold(tech))
+
+		// Offer to render README for repos without executables
+		if installResult.Profile != nil {
+			offerReadme(installResult.Profile.WorkingDir)
+		}
+		fmt.Println()
 		return
 	}
 
@@ -302,18 +309,103 @@ func printPostInstallSummary(installResult *phases.InstallResult) {
 	}
 
 	if installResult.Profile != nil {
-		fmt.Printf("  %s  To run the project locally:\n", ui.Muted("→"))
-		
 		runCmd := ""
 		if len(installResult.Profile.RunCommands) > 0 {
 			runCmd = strings.Join(installResult.Profile.RunCommands, " ")
-		} else {
-			runCmd = fmt.Sprintf("%q", "./"+binName)
+		} else if binName != "" {
+			// Validate that ./binName is actually an executable file, not a directory
+			candidatePath := filepath.Join(installResult.Profile.WorkingDir, binName)
+			info, err := os.Stat(candidatePath)
+			if err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+				runCmd = fmt.Sprintf("%q", "./"+binName)
+			} else {
+				// ./binName is a directory or doesn't exist — use tech-specific fallback
+				fallback := techRunFallback(installResult.Profile)
+				if fallback != "" {
+					runCmd = fallback
+				}
+			}
 		}
-		
-		fmt.Printf("     cd %s\n", ui.Muted(fmt.Sprintf("%q", installResult.Profile.WorkingDir)))
-		fmt.Printf("     %s\n\n", ui.SaffronBold(runCmd))
+
+		if runCmd != "" {
+			fmt.Printf("  %s  To run the project locally:\n", ui.Muted("→"))
+			fmt.Printf("     cd %s\n", ui.Muted(fmt.Sprintf("%q", installResult.Profile.WorkingDir)))
+			fmt.Printf("     %s\n\n", ui.SaffronBold(runCmd))
+		} else {
+			// No run command could be determined — offer README
+			offerReadme(installResult.Profile.WorkingDir)
+			fmt.Println()
+		}
 	}
+}
+
+// techRunFallback returns a tech-specific run command string when ./binName
+// is not a valid executable (e.g. it's a directory with the same name as the repo).
+func techRunFallback(profile *detection.TechProfile) string {
+	if profile == nil {
+		return ""
+	}
+	switch profile.Primary {
+	case detection.TechGo:
+		return "go run ."
+	case detection.TechRust:
+		return "cargo run --release"
+	case detection.TechPython:
+		for _, entry := range []string{"main.py", "app.py", "run.py", "cli.py"} {
+			candidate := filepath.Join(profile.WorkingDir, entry)
+			if _, err := os.Stat(candidate); err == nil {
+				return "python " + entry
+			}
+		}
+		repoName := filepath.Base(profile.WorkingDir)
+		return "python -m " + repoName
+	case detection.TechNode:
+		return "npm start"
+	case detection.TechJava:
+		if _, err := os.Stat(filepath.Join(profile.WorkingDir, "gradlew")); err == nil {
+			return "./gradlew run"
+		}
+		return "mvn exec:java"
+	case detection.TechZig:
+		return "zig build run"
+	case detection.TechFlutter:
+		return "flutter run"
+	case detection.TechDart:
+		return "dart run"
+	case detection.TechRuby:
+		return "bundle exec ruby main.rb"
+	case detection.TechDotnet:
+		return "dotnet run"
+	case detection.TechHaskell:
+		if _, err := os.Stat(filepath.Join(profile.WorkingDir, "stack.yaml")); err == nil {
+			return "stack run"
+		}
+		return "cabal run"
+	}
+	return ""
+}
+
+// offerReadme searches for a README file and offers to render it.
+// Used for repos where no executable was found (libraries, docs, unknown).
+func offerReadme(repoPath string) {
+	readmePath := ""
+	for _, candidate := range []string{"README.md", "readme.md", "Readme.md", "README.rst", "README.txt", "README"} {
+		full := filepath.Join(repoPath, candidate)
+		if _, err := os.Stat(full); err == nil {
+			readmePath = full
+			break
+		}
+	}
+	if readmePath == "" {
+		return
+	}
+
+	shouldRead, err := ui.Confirm("Would you like to read the README?")
+	if err != nil || !shouldRead {
+		return
+	}
+	fmt.Println()
+	_ = ui.RenderMarkdown(readmePath)
 }
 
 // detectCurrentShell returns the current shell name (bash, zsh, fish).

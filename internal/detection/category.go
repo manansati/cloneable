@@ -1,6 +1,7 @@
 package detection
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -79,8 +80,96 @@ func DetermineCategory(repoPath string, primary TechType, manifests []FoundManif
 		return CategoryLibrary
 	}
 
-	// Default: treat as an app
-	return CategoryApp
+	// Only promote to CategoryApp if there's real proof of an executable entry point.
+	// Without this gate, repos like script collections or mixed-content projects
+	// get treated as apps and receive bogus "./reponame" run commands.
+	if hasAppEntryPoint(repoPath, primary) {
+		return CategoryApp
+	}
+
+	// Default: unknown — the post-install summary will offer README rendering
+	// instead of suggesting a broken run command.
+	return CategoryUnknown
+}
+
+// hasAppEntryPoint returns true if the repo has a definitive executable entry point
+// that proves it's an application (not just a collection of files).
+func hasAppEntryPoint(repoPath string, tech TechType) bool {
+	switch tech {
+	case TechGo:
+		// Go app: main.go or cmd/ directory
+		_, errMain := os.Stat(filepath.Join(repoPath, "main.go"))
+		_, errCmd := os.Stat(filepath.Join(repoPath, "cmd"))
+		return errMain == nil || errCmd == nil
+	case TechRust:
+		// Rust app: src/main.rs or [[bin]] in Cargo.toml
+		_, errMain := os.Stat(filepath.Join(repoPath, "src", "main.rs"))
+		if errMain == nil {
+			return true
+		}
+		data, err := os.ReadFile(filepath.Join(repoPath, "Cargo.toml"))
+		if err == nil && strings.Contains(string(data), "[[bin]]") {
+			return true
+		}
+		return false
+	case TechPython:
+		// Python app: main.py, app.py, __main__.py, or entry points in packaging
+		for _, f := range []string{"main.py", "app.py", "__main__.py", "run.py", "cli.py"} {
+			if fileExists(repoPath, f) {
+				return true
+			}
+		}
+		return pythonIsCLI(repoPath) // entry points in pyproject/setup.py count
+	case TechNode:
+		// Node app: has "start" or "dev" script, or "bin" field.
+		// MUST have a "name" field to be considered a real application (needed for global install).
+		data, err := os.ReadFile(filepath.Join(repoPath, "package.json"))
+		if err == nil {
+			var pkg struct {
+				Name    string            `json:"name"`
+				Scripts map[string]string `json:"scripts"`
+				Bin     interface{}       `json:"bin"`
+			}
+			if json.Unmarshal(data, &pkg) == nil {
+				if pkg.Name == "" {
+					return false
+				}
+				if pkg.Bin != nil {
+					return true
+				}
+				if pkg.Scripts != nil {
+					if _, ok := pkg.Scripts["start"]; ok {
+						return true
+					}
+					if _, ok := pkg.Scripts["dev"]; ok {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	case TechJava:
+		// Java app: gradlew or pom.xml with mainClass
+		if fileExists(repoPath, "gradlew") {
+			return true
+		}
+		data, err := os.ReadFile(filepath.Join(repoPath, "pom.xml"))
+		return err == nil && strings.Contains(string(data), "mainClass")
+	case TechCpp, TechC:
+		// C/C++ with a build system is considered an app
+		return fileExists(repoPath, "CMakeLists.txt") ||
+			fileExists(repoPath, "Makefile") ||
+			fileExists(repoPath, "meson.build")
+	case TechZig:
+		return fileExists(repoPath, "build.zig")
+	case TechDotnet:
+		return true // .NET projects always have an entry point
+	case TechHaskell:
+		return true // Haskell projects always have an entry point
+	case TechDocker:
+		return true
+	}
+	return false
 }
 
 // isCLIProject returns true if the repo appears to be a CLI/TUI tool.
@@ -315,13 +404,53 @@ func RunCommand(repoPath string, tech TechType, category RepoCategory) []string 
 	case TechRust:
 		return []string{"cargo", "run", "--release"}
 	case TechNode:
+		pm := "npm"
 		if fileExists(repoPath, "yarn.lock") {
-			return []string{"yarn", "start"}
+			pm = "yarn"
+		} else if fileExists(repoPath, "pnpm-lock.yaml") {
+			pm = "pnpm"
 		}
-		if fileExists(repoPath, "pnpm-lock.yaml") {
-			return []string{"pnpm", "start"}
+
+		data, err := os.ReadFile(filepath.Join(repoPath, "package.json"))
+		if err == nil {
+			var pkg struct {
+				Scripts map[string]string `json:"scripts"`
+				Main    string            `json:"main"`
+				Bin     interface{}       `json:"bin"`
+			}
+			if err := json.Unmarshal(data, &pkg); err == nil {
+				if pkg.Scripts != nil {
+					if _, ok := pkg.Scripts["start"]; ok {
+						return []string{pm, "start"}
+					}
+					if _, ok := pkg.Scripts["dev"]; ok {
+						return []string{pm, "run", "dev"}
+					}
+				}
+				if pkg.Main != "" {
+					return []string{"node", pkg.Main}
+				}
+				if pkg.Bin != nil {
+					switch v := pkg.Bin.(type) {
+					case string:
+						return []string{"node", v}
+					case map[string]interface{}:
+						for _, script := range v {
+							if str, ok := script.(string); ok {
+								return []string{"node", str}
+							}
+						}
+					}
+				}
+			}
 		}
-		return []string{"npm", "start"}
+
+		if fileExists(repoPath, "index.js") {
+			return []string{"node", "index.js"}
+		}
+		
+		// If absolutely nothing is found, return empty so we don't suggest a broken command
+		return nil
 	case TechPython:
 		// Try common entry points in order
 		for _, entry := range []string{"main.py", "app.py", "run.py", "cli.py", "__main__.py"} {
@@ -473,33 +602,13 @@ func nodeHasBuildScript(repoPath string) bool {
 	if err != nil {
 		return false
 	}
-	content := string(data)
 
-	// Find "scripts" section
-	scriptsIdx := strings.Index(content, `"scripts"`)
-	if scriptsIdx < 0 {
-		return false
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
 	}
-
-	// Look for "build" key within the scripts object
-	rest := content[scriptsIdx:]
-	braceIdx := strings.Index(rest, "{")
-	if braceIdx < 0 {
-		return false
-	}
-
-	// Find matching closing brace for scripts object
-	depth := 0
-	for i := braceIdx; i < len(rest); i++ {
-		if rest[i] == '{' {
-			depth++
-		} else if rest[i] == '}' {
-			depth--
-			if depth == 0 {
-				scriptsBlock := rest[braceIdx : i+1]
-				return strings.Contains(scriptsBlock, `"build"`)
-			}
-		}
+	if err := json.Unmarshal(data, &pkg); err == nil && pkg.Scripts != nil {
+		_, ok := pkg.Scripts["build"]
+		return ok
 	}
 	return false
 }

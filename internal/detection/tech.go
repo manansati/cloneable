@@ -1,11 +1,13 @@
 package detection
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	enry "github.com/go-enry/go-enry/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -105,96 +107,81 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 		return profile, nil
 	}
 
-	// ── Step 2: Scan manifest files ───────────────────────────────────────────
+	// ── Step 2: Structural heuristic — dotfiles (BEFORE manifests) ────────────
+	// A dotfile repo must never be hijacked by a nested package.json in .config/.
+	if isDotfileRepo(repoPath) {
+		profile.Primary = TechDotfile
+		profile.Category = CategoryDotfiles
+		profile.Confidence = 75
+		return profile, nil
+	}
+
+	// ── Step 3: Scan manifest files ───────────────────────────────────────────
 	manifests, err := ScanManifests(repoPath, 2)
 	if err != nil {
 		return profile, err
 	}
 	profile.Manifests = manifests
 
-	// Wait, we don't return early. We just proceed.
-	// ── Step 4: Determine primary tech from manifests ─────────────────────────
-	// Sort by confidence descending, then by depth ascending (root = preferred)
+	// ── Step 4: Sort manifests — depth FIRST, then confidence ─────────────────
+	// Root manifests (Depth 0) ALWAYS win over deeper manifests, regardless of
+	// confidence. This prevents a nested hooks/package.json from hijacking a
+	// root install.sh script repository.
 	sort.Slice(manifests, func(i, j int) bool {
-		if manifests[i].Entry.Confidence != manifests[j].Entry.Confidence {
-			return manifests[i].Entry.Confidence > manifests[j].Entry.Confidence
+		if manifests[i].Depth != manifests[j].Depth {
+			return manifests[i].Depth < manifests[j].Depth
 		}
-		return manifests[i].Depth < manifests[j].Depth
+		return manifests[i].Entry.Confidence > manifests[j].Entry.Confidence
 	})
 
-	// The first IsPrimary entry at highest confidence wins as Primary.
-	// BUT: if two primaries have the same confidence at the same depth,
-	// count source files to break the tie. This handles repos like Neovim
-	// which have both build.zig (100) and CMakeLists.txt (90) — but are
-	// fundamentally C projects by source file count.
+	// ── Step 5: Pick primary from manifests ───────────────────────────────────
+	// First pass: only consider root (Depth == 0) primaries.
+	hasRootPrimary := false
 	for _, m := range manifests {
-		if m.Entry.IsPrimary && profile.Primary == TechUnknown {
-			profile.Primary = m.Entry.Tech
-			profile.Confidence = m.Entry.Confidence
-			profile.WorkingDir = filepath.Dir(m.FullPath)
-			if m.Depth > 0 {
-				profile.Confidence = max(profile.Confidence-10, 50)
+		if m.Entry.IsPrimary && m.Depth == 0 {
+			hasRootPrimary = true
+			if profile.Primary == TechUnknown {
+				profile.Primary = m.Entry.Tech
+				profile.Confidence = m.Entry.Confidence
+				profile.WorkingDir = filepath.Dir(m.FullPath)
 			}
 		}
 	}
 
-	// Source-file tie-breaker: if the winner has confidence <= 100 and there
-	// is a competing primary at root with confidence >= 85, count actual source
-	// files to see which language dominates.
-	newPrimary := refineBySourceFiles(repoPath, manifests, profile.Primary)
-	if newPrimary != profile.Primary {
-		profile.Primary = newPrimary
-		profile.WorkingDir = repoPath
+	// Second pass: if no root primary, fall back to deeper manifests.
+	if !hasRootPrimary {
+		for _, m := range manifests {
+			if m.Entry.IsPrimary && profile.Primary == TechUnknown {
+				profile.Primary = m.Entry.Tech
+				profile.Confidence = max(m.Entry.Confidence-10, 50)
+				profile.WorkingDir = filepath.Dir(m.FullPath)
+				break
+			}
+		}
 	}
 
-	// ── Step 4.5: Structural heuristics fallback ──────────────────────────────
-	// If no primary manifest was found (or if we only found non-primary manifests like Makefile)
+	// ── Step 6: go-enry language detection fallback ───────────────────────────
+	// If no manifest determined the primary, use go-enry to analyze source files.
 	if profile.Primary == TechUnknown {
-		if isDotfileRepo(repoPath) {
-			profile.Primary = TechDotfile
-			profile.Category = CategoryDotfiles
-			profile.Confidence = 75
+		enryTech := detectDominantLanguage(repoPath)
+		if enryTech != TechUnknown {
+			profile.Primary = enryTech
+			profile.Confidence = 55
+		}
+	}
+
+	// ── Step 6.5: Documentation and script fallbacks ──────────────────────────
+	if profile.Primary == TechUnknown {
+		if isDocsRepo(repoPath, false) {
+			profile.Primary = TechDocs
+			profile.Category = CategoryDocs
+			profile.Confidence = 70
 			return profile, nil
 		}
-		if isDocsRepo(repoPath, false) {
-			counts := countSourceFiles(repoPath)
-			totalSourceFiles := 0
-			for _, count := range counts {
-				totalSourceFiles += count
-			}
-			// Only treat as pure documentation if there are very few actual source files
-			if totalSourceFiles < 5 {
-				profile.Primary = TechDocs
-				profile.Category = CategoryDocs
-				profile.Confidence = 70
-				return profile, nil
-			}
-		}
-
-		// Fallback 1: If no manifest is present, try to guess the language by counting source files.
-		// Useful for raw script repos like system-design-primer.
-		counts := countSourceFiles(repoPath)
-		maxCount := 0
-		var dominant TechType
-		for lang, count := range counts {
-			if count > maxCount {
-				maxCount = count
-				dominant = lang
-			}
-		}
-		// Require at least 2 source files to guess the language
-		if maxCount >= 2 && dominant != TechUnknown {
-			profile.Primary = dominant
-			profile.Confidence = 40 // Low confidence, but enough to bypass the <30% error
-			// Note: We don't return early here, so Category can be determined properly later.
-		}
-
-		if hasShellScripts(repoPath) && profile.Primary == TechUnknown {
+		if hasShellScripts(repoPath) {
 			profile.Primary = TechScripts
 			profile.Category = CategoryScripts
 			profile.Confidence = 65
-			// We DO NOT return early here because a repo with a Makefile and shell scripts
-			// might need `make install` from the Install commands logic later.
 		}
 	}
 
@@ -208,13 +195,13 @@ func DetectTech(repoPath string) (*TechProfile, error) {
 		}
 	}
 
-	// ── Step 5: Determine category ────────────────────────────────────────────
+	// ── Step 7: Determine category ────────────────────────────────────────────
 	profile.Category = DetermineCategory(profile.WorkingDir, profile.Primary, manifests)
 
-	// ── Step 6: Determine system deps ─────────────────────────────────────────
+	// ── Step 8: Determine system deps ─────────────────────────────────────────
 	profile.SystemDeps = systemDepsFor(profile.WorkingDir, profile.Primary)
 
-	// ── Step 7: Determine build / run / install commands ─────────────────────
+	// ── Step 9: Determine build / run / install commands ─────────────────────
 	profile.BuildCommands = BuildCommand(profile.WorkingDir, profile.Primary)
 	profile.RunCommands = RunCommand(profile.WorkingDir, profile.Primary, profile.Category)
 	profile.InstallCommands = InstallGlobalCommand(profile.WorkingDir, profile.Primary)
@@ -540,87 +527,13 @@ func TechDisplayName(tech TechType) string {
 	return string(tech)
 }
 
-// max returns the larger of two ints.
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// refineBySourceFiles is called when manifest-based detection might have picked
-// the wrong primary. It counts actual source files by extension to validate or
-// correct the detected tech. This handles repos like Neovim that have a build.zig
-// (added later for optional Zig builds) but are fundamentally C/C++ projects.
-func refineBySourceFiles(repoPath string, manifests []FoundManifest, detected TechType) TechType {
-	// Only apply correction when there are competing primaries at root
-	rootPrimaries := make(map[TechType]int) // tech -> manifest confidence
-	for _, m := range manifests {
-		if m.Entry.IsPrimary && m.Depth == 0 {
-			if existing, ok := rootPrimaries[m.Entry.Tech]; !ok || m.Entry.Confidence > existing {
-				rootPrimaries[m.Entry.Tech] = m.Entry.Confidence
-			}
-		}
-	}
-
-	// If only one primary at root, trust it — no correction needed
-	if len(rootPrimaries) <= 1 {
-		return detected
-	}
-
-	// Count source files by language
-	counts := countSourceFiles(repoPath)
-	if len(counts) == 0 {
-		return detected
-	}
-
-	// Find the dominant language
-	dominant := detected
-	maxCount := 0
-	for lang, count := range counts {
-		if count > maxCount {
-			maxCount = count
-			dominant = lang
-		}
-	}
-
-	// Only override if the dominant language is very clearly different
-	// (at least 3x more files than the detected tech's file count)
-	detectedCount := counts[detected]
-	if detectedCount == 0 || maxCount >= detectedCount*3 {
-		// Make sure the dominant tech actually has a root manifest
-		if _, ok := rootPrimaries[dominant]; ok {
-			return dominant
-		}
-	}
-
-	return detected
-}
-
-// countSourceFiles walks the repo root (one level deep) and counts
-// source files per technology type by extension.
-func countSourceFiles(repoPath string) map[TechType]int {
-	counts := make(map[TechType]int)
-
-	// Extension → tech type mapping for source file counting
-	extToTech := map[string]TechType{
-		".c":    TechC,
-		".h":    TechC,
-		".cpp":  TechCpp,
-		".cc":   TechCpp,
-		".cxx":  TechCpp,
-		".hpp":  TechCpp,
-		".zig":  TechZig,
-		".rs":   TechRust,
-		".go":   TechGo,
-		".py":   TechPython,
-		".js":   TechNode,
-		".ts":   TechNode,
-		".java": TechJava,
-		".kt":   TechKotlin,
-		".rb":   TechRuby,
-		".lua":  TechUnknown, // Lua — not a primary tech, but helps with neovim detection
-	}
+// detectDominantLanguage uses go-enry to analyze the repository's source files
+// and returns the dominant programming language as a TechType.
+// This replaces the old countSourceFiles/refineBySourceFiles approach with
+// a comprehensive, content-aware language detection engine.
+func detectDominantLanguage(repoPath string) TechType {
+	// langBytes tracks total bytes per enry language name.
+	langBytes := make(map[string]int64)
 
 	filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -628,24 +541,109 @@ func countSourceFiles(repoPath string) map[TechType]int {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".venv" || name == "__pycache__" {
+			if shouldSkipDir(name) || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		
-		ext := strings.ToLower(filepath.Ext(d.Name()))
-		if tech, ok := extToTech[ext]; ok && tech != TechUnknown {
-			counts[tech]++
+
+		// Prevent blocking on named pipes (FIFOs) or other non-regular files
+		if !d.Type().IsRegular() {
+			return nil
 		}
+
+		// Get path relative to repo root for enry analysis
+		relPath, err := filepath.Rel(repoPath, path)
+		if err != nil {
+			return nil
+		}
+
+		// Skip vendor, generated, and dotfiles
+		if enry.IsVendor(relPath) || enry.IsDotFile(relPath) {
+			return nil
+		}
+
+		// Read up to 16KB for language detection (enry doesn't need the whole file)
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		content, err := io.ReadAll(io.LimitReader(f, 16*1024))
+		if err != nil || len(content) == 0 {
+			return nil
+		}
+
+		// Skip generated files
+		if enry.IsGenerated(relPath, content) {
+			return nil
+		}
+
+		lang := enry.GetLanguage(filepath.Base(path), content)
+		if lang == "" || enry.GetLanguageType(lang) != enry.Programming {
+			return nil
+		}
+
+		// Use actual file size for accurate byte weighting
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		langBytes[lang] += info.Size()
+
 		return nil
 	})
 
-	// C and C++ are the same project type — merge them
-	if cCount, ok := counts[TechC]; ok {
-		counts[TechCpp] += cCount
-		delete(counts, TechC)
+	if len(langBytes) == 0 {
+		return TechUnknown
 	}
 
-	return counts
+	// Find the dominant language by byte count
+	var dominant string
+	var maxBytes int64
+	for lang, bytes := range langBytes {
+		if bytes > maxBytes {
+			maxBytes = bytes
+			dominant = lang
+		}
+	}
+
+	return enryLangToTech(dominant)
+}
+
+// enryLangToTech maps a go-enry language name to our internal TechType.
+func enryLangToTech(lang string) TechType {
+	switch lang {
+	case "Go":
+		return TechGo
+	case "Rust":
+		return TechRust
+	case "JavaScript", "TypeScript", "TSX", "JSX":
+		return TechNode
+	case "Python":
+		return TechPython
+	case "Java":
+		return TechJava
+	case "Kotlin":
+		return TechKotlin
+	case "C":
+		return TechC
+	case "C++":
+		return TechCpp
+	case "Zig":
+		return TechZig
+	case "Dart":
+		return TechDart
+	case "Ruby":
+		return TechRuby
+	case "C#", "F#":
+		return TechDotnet
+	case "Haskell":
+		return TechHaskell
+	case "Shell", "Bash", "Zsh", "Fish":
+		return TechScripts
+	default:
+		return TechUnknown
+	}
 }
