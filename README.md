@@ -80,7 +80,7 @@ Flags:
 
 ---
 
-## For developers — build from source
+## For Nerds — Build from Source
 
 ```sh
 git clone https://github.com/manansati/cloneable
