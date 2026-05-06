@@ -1,171 +1,82 @@
 # Cloneable installer for Windows
 #
-# Usage (PowerShell as Administrator):
+# Usage (run in PowerShell):
 #   irm https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.ps1 | iex
-#
-# Installs to C:\Program Files\cloneable and adds to system PATH.
-# Run PowerShell as Administrator for this to work.
 
-$ErrorActionPreference = "Stop"
+#Requires -Version 5.1
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-$Repo      = "manansati/cloneable"
-$Binary    = "cloneable.exe"
-$InstDir   = "C:\Program Files\cloneable"
+$REPO        = "manansati/cloneable"
+$BINARY      = "cloneable.exe"
+$INSTALL_DIR = "$env:LOCALAPPDATA\Programs\cloneable"
+$BINARY_URL  = "https://raw.githubusercontent.com/$REPO/main/binary/cloneable.exe"
 
-function Write-Info    ($m) { Write-Host "  -> $m" -ForegroundColor DarkYellow }
-function Write-Success ($m) { Write-Host "  + $m"  -ForegroundColor Green }
-function Write-Muted   ($m) { Write-Host "  $m"    -ForegroundColor DarkGray }
-function Write-Fail    ($m) { Write-Host "`n  x $m`n" -ForegroundColor Red; exit 1 }
+# ── Enable ANSI colours on Windows 10+ ───────────────────────────────────────
+try {
+  [System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  $kernel32 = Add-Type -MemberDefinition @'
+    [DllImport("kernel32.dll")]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll")]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+'@ -Name 'Kernel32' -Namespace 'Win32' -PassThru
+  $handle = [Win32.Kernel32]::GetStdHandle(-11)
+  $mode   = 0
+  [Win32.Kernel32]::GetConsoleMode($handle, [ref]$mode) | Out-Null
+  [Win32.Kernel32]::SetConsoleMode($handle, ($mode -bor 4)) | Out-Null
+} catch {}
 
-# ── Admin check ───────────────────────────────────────────────────────────────
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-  [Security.Principal.WindowsBuiltInRole]::Administrator
-)
+$ESC    = [char]27
+$ORANGE = "${ESC}[38;2;255;140;0m"
+$GREEN  = "${ESC}[38;2;0;230;118m"
+$RED    = "${ESC}[38;2;255;82;82m"
+$GRAY   = "${ESC}[38;2;136;136;136m"
+$BOLD   = "${ESC}[1m"
+$RESET  = "${ESC}[0m"
 
-if (-not $isAdmin) {
-  Write-Host "`n  x This installer needs Administrator rights." -ForegroundColor Red
+function Print-Logo {
   Write-Host ""
-  Write-Host "  How to fix:" -ForegroundColor DarkGray
-  Write-Host "    1. Search for PowerShell in Start Menu" -ForegroundColor DarkGray
-  Write-Host "    2. Right-click -> Run as Administrator" -ForegroundColor DarkGray
-  Write-Host "    3. Paste and run the install command again" -ForegroundColor DarkGray
+  Write-Host "${ORANGE}${BOLD} ██████╗██╗      ██████╗ ███╗   ██╗███████╗ █████╗ ██████╗ ██╗     ███████╗${RESET}"
+  Write-Host "${ORANGE}${BOLD}██╔════╝██║     ██╔═══██╗████╗  ██║██╔════╝██╔══██╗██╔══██╗██║     ██╔════╝${RESET}"
+  Write-Host "${ORANGE}${BOLD}██║     ██║     ██║   ██║██╔██╗ ██║█████╗  ███████║██████╔╝██║     █████╗  ${RESET}"
+  Write-Host "${ORANGE}${BOLD}██║     ██║     ██║   ██║██║╚██╗██║██╔══╝  ██╔══██║██╔══██╗██║     ██╔══╝  ${RESET}"
+  Write-Host "${ORANGE}${BOLD}╚██████╗███████╗╚██████╔╝██║ ╚████║███████╗██║  ██║██████╔╝███████╗███████╗${RESET}"
+  Write-Host "${ORANGE}${BOLD} ╚═════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${RESET}"
   Write-Host ""
-  exit 1
 }
 
-# ── Detect architecture ───────────────────────────────────────────────────────
-function Get-Arch {
-  $p = (Get-WmiObject Win32_Processor).Architecture
-  if ($p -eq 9) { return "amd64" }
-  if ($p -eq 12) { return "arm64" }
-  Write-Fail "Unsupported CPU architecture"
+function Write-Info    ($msg) { Write-Host "  ${ORANGE}→${RESET}  $msg" }
+function Write-Success ($msg) { Write-Host "  ${GREEN}${BOLD}✓${RESET}  $msg" }
+function Write-Muted   ($msg) { Write-Host "  ${GRAY}$msg${RESET}" }
+function Write-Err     ($msg) { Write-Host "`n  ${RED}✗${RESET}  $msg`n"; exit 1 }
+
+# ── Download binary ───────────────────────────────────────────────────────────
+Print-Logo
+Write-Info "Downloading cloneable..."
+
+New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
+
+try {
+  Invoke-WebRequest -Uri $BINARY_URL -OutFile "$INSTALL_DIR\$BINARY" -UseBasicParsing
+} catch {
+  Write-Err "Download failed. Check your internet connection."
 }
 
-# ── Fetch latest release ──────────────────────────────────────────────────────
-function Get-LatestVersion {
-  $url = "https://api.github.com/repos/$Repo/releases/latest"
-  $headers = @{ "User-Agent" = "cloneable-installer" }
-  try {
-    $r = Invoke-RestMethod -Uri $url -Headers $headers -ErrorAction Stop
-    if ($r.message) { return "" }  # "Not Found" etc
-    return $r.tag_name.TrimStart("v")
-  } catch {
-    return ""
-  }
+# ── Add to user PATH if not already there ─────────────────────────────────────
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($currentPath -notlike "*$INSTALL_DIR*") {
+  Write-Info "Adding to PATH..."
+  [Environment]::SetEnvironmentVariable("Path", "$currentPath;$INSTALL_DIR", "User")
+  $env:PATH = "$env:PATH;$INSTALL_DIR"
+  Write-Muted "Restart your terminal for PATH to take effect."
 }
-
-# ── Install pre-built binary ──────────────────────────────────────────────────
-function Install-Binary($version, $arch) {
-  $file = "cloneable_${version}_windows_${arch}.zip"
-  $url  = "https://github.com/$Repo/releases/download/v$version/$file"
-  $tmp  = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid())
-  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-
-  Write-Info "Downloading v$version (windows/$arch)..."
-
-  try {
-    Invoke-WebRequest -Uri $url -OutFile "$tmp\$file" -UseBasicParsing -ErrorAction Stop
-  } catch {
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    return $false
-  }
-
-  try {
-    Expand-Archive -Path "$tmp\$file" -DestinationPath $tmp -Force
-  } catch {
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    return $false
-  }
-
-  $exe = Get-ChildItem -Path $tmp -Filter "cloneable.exe" -Recurse | Select-Object -First 1
-  if (-not $exe) {
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    return $false
-  }
-
-  New-Item -ItemType Directory -Path $InstDir -Force | Out-Null
-  Copy-Item $exe.FullName -Destination "$InstDir\$Binary" -Force
-  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-  return $true
-}
-
-# ── Build from source (fallback) ──────────────────────────────────────────────
-function Build-FromSource {
-  Write-Host "`n  Building from source..." -ForegroundColor White
-  Write-Muted "(No pre-built release found)"
-  Write-Host ""
-
-  if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    Write-Fail "Go not found. Install from https://go.dev/dl then run this script again."
-  }
-  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Fail "git not found. Install from https://git-scm.com then run this script again."
-  }
-
-  Write-Info "Go $(go version) found"
-
-  $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid())
-  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-
-  Write-Info "Cloning repository..."
-  git clone --depth=1 "https://github.com/$Repo.git" "$tmp\src" 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { Write-Fail "Could not clone repository." }
-
-  Write-Info "Building binary..."
-  Set-Location "$tmp\src"
-  go mod tidy 2>&1 | Out-Null
-  go build -ldflags "-s -w -X github.com/manansati/cloneable/cmd.Version=dev" -o "$tmp\cloneable.exe" .
-  if ($LASTEXITCODE -ne 0) { Write-Fail "Build failed." }
-
-  New-Item -ItemType Directory -Path $InstDir -Force | Out-Null
-  Copy-Item "$tmp\cloneable.exe" -Destination "$InstDir\$Binary" -Force
-  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# ── Add to system PATH ────────────────────────────────────────────────────────
-function Add-ToPath {
-  $machinePath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
-  if ($machinePath -like "*$InstDir*") {
-    return  # Already there
-  }
-  [Environment]::SetEnvironmentVariable("PATH", "$machinePath;$InstDir", "Machine")
-  Write-Muted "Added $InstDir to system PATH"
-  Write-Muted "Restart your terminal to use cloneable from anywhere"
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "  Installing Cloneable" -ForegroundColor DarkYellow
-Write-Host ""
-
-$arch    = Get-Arch
-$version = Get-LatestVersion
-
-if ($version) {
-  $ok = Install-Binary $version $arch
-  if ($ok) {
-    Add-ToPath
-    Write-Host ""
-    Write-Success "Cloneable v$version installed"
-    Write-Muted "Location: $InstDir\$Binary"
-    Write-Host ""
-    Write-Host "  Try it (open a new terminal):"
-    Write-Host "    cloneable --help"
-    Write-Host ""
-    exit 0
-  }
-  Write-Muted "Download failed — building from source..."
-} else {
-  Write-Muted "No releases found — building from source..."
-}
-
-Build-FromSource
-Add-ToPath
 
 Write-Host ""
-Write-Success "Cloneable installed"
-Write-Muted "Location: $InstDir\$Binary"
+Write-Success "Cloneable installed to $INSTALL_DIR\$BINARY"
 Write-Host ""
-Write-Host "  Open a new terminal and try:"
-Write-Host "    cloneable --help"
+Write-Host "  ${GRAY}Get started (open a new terminal, then):${RESET}"
+Write-Host "    ${ORANGE}cloneable --help${RESET}"
 Write-Host ""
