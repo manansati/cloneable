@@ -68,8 +68,8 @@ Flags:
 
 ## Package Managers Used
 
-**Linux:** apt · dnf · pacman · zypper · apk · xbps · yay · paru · snap · flatpak
-**macOS:** Homebrew
+**Linux:** apt · dnf · pacman · zypper · apk · xbps · yay · paru · snap · flatpak <br>
+**macOS:** Homebrew <br>
 **Windows:** winget · Chocolatey · Scoop
 
 ---
