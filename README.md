@@ -24,24 +24,31 @@ curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/in
 ## Usage
 
 ```
-cloneable <git-url>    Clone, install Dependency, and Install Globally
-cloneable              Browse Trending Repositries
+Usage:
+  cloneable <git-url>    Clone and install dependencies for a repository
+  cloneable              Explore trending repositories (or run inside cloned repo)
 
 Commands:
-  clone <url>    Clone only
-  search <query> Search GitHub Interactively
-  info <url>     Technology Breakdown
-  list           List Installed Repository
-  remove <name>  Remove an Installation
+  clone <url>    Clone and install dependencies
+  explore        Explore trending repositories
+  search <query> Search GitHub interactively
+  info [url]     Show language breakdown
+  list           List installed repositories
+  remove <name>  Remove an installation
   update         Update Cloneable
+  login <token>  Set GitHub API token
+  uninstall      Uninstall Cloneable
+  run            Launch the current repository
+  fix            Fix broken dependencies
+  logs           View install logs
 
 Flags:
-  -r, --run      Launch the Current Repository
-  -f, --fix      Fix broken Dependencies
-  -i, --info     Technology Breakdown (Current Folder)
-  -l, --logs     View Install Logs
-  -v, --version  Print Version
-  -h, --help     Show this Help
+  -r, --run      Launch the current repository
+  -f, --fix      Fix broken dependencies
+  -i, --info     Language breakdown (current repo)
+  -l, --logs     View install logs
+  -v, --version  Print version
+  -h, --help     Show this help
 ```
 
 ---

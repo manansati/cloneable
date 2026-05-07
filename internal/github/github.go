@@ -69,6 +69,20 @@ func (c *client) get(endpoint string, dest interface{}) error {
 		return &NotFoundError{}
 	}
 
+	if resp.StatusCode == 401 {
+		if c.token != "" {
+			// Token is invalid, remove it from config and fallback to free API
+			c.token = ""
+			cfg := LoadConfig()
+			cfg.GitHubToken = ""
+			_ = SaveConfig(cfg)
+			
+			// Retry the request silently
+			return c.get(endpoint, dest)
+		}
+		return fmt.Errorf("GitHub API error 401 (Unauthorized)")
+	}
+
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("GitHub API error %d", resp.StatusCode)
 	}
@@ -324,4 +338,31 @@ func TruncateDesc(s string, maxLen int) string {
 		trimmed = trimmed[:idx]
 	}
 	return trimmed + "…"
+}
+
+// ValidateToken checks if a given token is accepted by GitHub by querying the rate limit endpoint.
+func ValidateToken(token string) error {
+	req, err := http.NewRequest("GET", baseURL+"/rate_limit", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("GitHub API error 401 (Unauthorized)")
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("GitHub API error %d", resp.StatusCode)
+	}
+	return nil
 }

@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 
 	gh "github.com/manansati/cloneable/internal/github"
@@ -38,8 +40,17 @@ var updateCmd = &cobra.Command{
 
 		fmt.Printf("  %s  New version available: %s\n\n",
 			ui.Saffron("↑"), ui.SaffronBold("v"+latest))
-		fmt.Printf("  Update by running:\n")
-		fmt.Printf("    curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sudo sh\n\n")
+		fmt.Printf("  Updating Cloneable...\n")
+
+		c := exec.Command("sh", "-c", "curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sudo sh")
+		c.Stdin = os.Stdin
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("failed to update: %w", err)
+		}
+		
 		return nil
 	},
 }

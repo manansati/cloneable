@@ -305,10 +305,6 @@ func (m SearchModel) View() string {
 
 	b.WriteString("  ")
 	b.WriteString(styleSearchPrompt.Render(desc))
-	
-	if m.totalCount > 0 {
-		b.WriteString(styleMeta.Render(fmt.Sprintf("  (showing %d of %s repos)", len(m.results), FormatStars(m.totalCount))))
-	}
 	b.WriteString("\n\n")
 
 	// Divider

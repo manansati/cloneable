@@ -81,10 +81,14 @@ func init() {
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(exploreCmd)
+	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(updateCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(removeCmd)
+	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(uninstallCmd)
 
+	rootCmd.Flags().BoolP("run", "r", false, "Launch the Current Repository")
 	rootCmd.Flags().BoolP("version", "v", false, "Print version information and exit")
 	rootCmd.Flags().BoolP("fix", "f", false, "Fix broken dependencies and reinstall")
 	rootCmd.Flags().BoolP("info", "i", false, "Show language/technology breakdown of current repo")
@@ -97,15 +101,21 @@ func init() {
   cloneable              Explore trending repositories (or run inside cloned repo)
 
 Commands:
-  clone <url>    Clone only
-  explore        Trending repositories
+  clone <url>    Clone and install dependencies
+  explore        Explore trending repositories
   search <query> Search GitHub interactively
-  info [url]     Language breakdown
-  list           List installed repos
+  info [url]     Show language breakdown
+  list           List installed repositories
   remove <name>  Remove an installation
   update         Update Cloneable
+  login <token>  Set GitHub API token
+  uninstall      Uninstall Cloneable
+  run            Launch the current repository
+  fix            Fix broken dependencies
+  logs           View install logs
 
 Flags:
+  -r, --run      Launch the current repository
   -f, --fix      Fix broken dependencies
   -i, --info     Language breakdown (current repo)
   -l, --logs     View install logs
@@ -119,6 +129,11 @@ func rootRunE(cmd *cobra.Command, args []string) error {
 	if versionFlag {
 		printVersion()
 		return nil
+	}
+
+	runFlag, _ := cmd.Flags().GetBool("run")
+	if runFlag {
+		return runCmd.RunE(runCmd, []string{})
 	}
 
 	fixFlag, _ := cmd.Flags().GetBool("fix")
