@@ -17,8 +17,10 @@
 curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sudo sh
 ```
 
-**Windows** — Under Development
-
+**Windows** — Under Development (use WSL/minGW)
+```sh
+curl -fsSL https://raw.githubusercontent.com/manansati/cloneable/main/scripts/install.sh | sudo sh
+```
 ---
 
 ## Usage
@@ -83,7 +85,7 @@ Flags:
 
 ## Troubleshooting
 
-### Under Development
+### If facing any issue, please let us know through issue tab, it;s under development 
 
 ---
 
